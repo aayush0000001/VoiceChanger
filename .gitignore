@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.dll
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / PyInstaller / Nuitka build artifacts
+build/
+dist/
+*.spec
+*.build/
+*.dist/
+*.onefile-build/
+
+# Local User Profiles & Voice Configs
+tactical_voice_profile.json
+*.profile.json
+
+# AI Voice Weights & Checkpoints (keep repo lightweight)
+models/
+weights/
+*.onnx
+*.pth
+*.pt
+*.index
+
+# IDE & OS metadata
+.idea/
