@@ -76,7 +76,7 @@ def _add_settings_rows(window) -> None:
 
     autostart.checkedChanged.connect(toggled)
     sv.appCard.add_row(
-        FluentIcon.POWER_BUTTON,
+        FluentIcon.PIN,
         "Start with Windows",
         "Starts V-COMMS in the tray when you sign in, so your hotkeys are ready before you open VALORANT.",
         autostart,
@@ -87,8 +87,8 @@ def _add_settings_rows(window) -> None:
     folder.clicked.connect(lambda: appdata.open_folder(appdata.roaming_dir()))
     sv.appCard.add_row(
         FluentIcon.FOLDER,
-        "Open data folder",
-        "Settings, voice profile and custom presets. Uninstalling asks before it deletes them."
+        "Your data",
+        "Settings, voice profile and custom presets. Uninstalling asks before it deletes them.",
         folder,
     )
 
