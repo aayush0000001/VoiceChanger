@@ -13,6 +13,9 @@
 #ifndef AppVersion
   #define AppVersion "1.1.0"
 #endif
+#ifndef OutputSuffix
+  #define OutputSuffix ""
+#endif
 #ifndef VBCableDir
   #error Pass /DVBCableDir=<folder with the unzipped VBCABLE_Driver_Pack> (build.ps1 does)
 #endif
@@ -50,7 +53,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 OutputDir=..\dist\installer
-OutputBaseFilename=V-COMMS-Setup-{#AppVersion}
+OutputBaseFilename=V-COMMS-Setup-{#AppVersion}{#OutputSuffix}
 SetupIconFile=..\app_icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
@@ -324,7 +327,7 @@ var
   DataBox, CableBox: TNewCheckBox;
   OkButton, CancelButton: TNewButton;
 begin
-  Form := CreateCustomForm(ScaleX(420), ScaleY(190), False, False);
+  Form := CreateCustomForm(ScaleX(420), ScaleY(150), False, False);
   try
     Form.Caption := 'Uninstall V-COMMS';
     Text := TNewStaticText.Create(Form);
@@ -379,7 +382,9 @@ var
 begin
   Result := True;
   if not UninstallSilent then
-    Result := AskUninstallChoices();
+    Result := AskUninstallChoices()
+  else
+    RemoveDataChoice := Pos('/REMOVEUSERDATA', Uppercase(GetCmdTail)) > 0;  { silent: keep data unless asked }
   if Result and FileExists(ExpandConstant('{app}\{#AppExe}')) then
     Exec(ExpandConstant('{app}\{#AppExe}'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
