@@ -40,6 +40,9 @@ class LiveView(PageBase):
     presetImportRequested = pyqtSignal(str)         # file path
     flagToggled = pyqtSignal(str, bool)        # "mic_muted" | "bypass_effects", new value
 
+    MUTE_CAPTION = "Silences the output."
+    BYPASS_CAPTION = "Raw voice, no effects."
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__("liveView", "Live", "Pick a voice, mute or bypass, and watch your levels.", parent)
 
@@ -49,6 +52,7 @@ class LiveView(PageBase):
         self._tag = ""
         self._stats_at = 0.0
         self._tiles: Dict[str, PresetTile] = {}
+        self._tile_actions: Dict[str, str] = {}   # built-in tile key -> the hotkey action that selects it
         self._active_preset = ""
         self._custom_names: List[str] = []
         self._reserved: List[str] = []
@@ -82,11 +86,11 @@ class LiveView(PageBase):
         self.controlsCard = GroupCard("Quick controls")
         self.muteSwitch = self._make_switch("mic_muted")
         self.bypassSwitch = self._make_switch("bypass_effects")
-        self.controlsCard.add_row(
-            FluentIcon.MUTE, "Hardware mute", "Ctrl + Alt + F10  ·  Silences the output.", self.muteSwitch
+        self.muteRow = self.controlsCard.add_row(
+            FluentIcon.MUTE, "Hardware mute", self.MUTE_CAPTION, self.muteSwitch
         )
-        self.controlsCard.add_row(
-            FluentIcon.SPEED_OFF, "Bypass effects", "Ctrl + Alt + F9  ·  Raw voice, no effects.", self.bypassSwitch
+        self.bypassRow = self.controlsCard.add_row(
+            FluentIcon.SPEED_OFF, "Bypass effects", self.BYPASS_CAPTION, self.bypassSwitch
         )
 
         self.levelsCard = Card("Levels")
@@ -134,10 +138,13 @@ class LiveView(PageBase):
         self._custom_names = list(data["custom_names"])
         self.tileGrid.clear()
         self._tiles.clear()
+        self._tile_actions.clear()
         for p in data["presets"]:
             tile = PresetTile(
                 p["key"], p["title"], p["tag"], p["hotkey"], p["blurb"], icon_by_name(p["icon"]), custom=p["custom"]
             )
+            if p.get("hotkey_action"):
+                self._tile_actions[p["key"]] = p["hotkey_action"]
             tile.chosen.connect(self.presetRequested)
             if self._lite:
                 tile.backgroundColorAni.setDuration(0)
@@ -148,6 +155,27 @@ class LiveView(PageBase):
             self._tiles[p["key"]] = tile
             self.tileGrid.add(tile)
         self.apply_preset(self._active_preset)
+
+    def apply_hotkeys(self, data: dict) -> None:
+        """The hotkeys shown next to the voices, mute and bypass follow the ones set in Settings."""
+        def apply() -> None:
+            by_id = {item["id"]: item for item in data["items"]}
+            for row, action, caption in (
+                (self.muteRow, "mute", self.MUTE_CAPTION),
+                (self.bypassRow, "bypass", self.BYPASS_CAPTION),
+            ):
+                item = by_id.get(action)
+                keys = item["text"] if item and item["bound"] else ""
+                row.contentLabel.setText(f"{keys}  ·  {caption}" if keys else caption)
+                switch = self.muteSwitch if action == "mute" else self.bypassSwitch
+                switch.setToolTip(f"Hotkey: {keys}" if keys else "No hotkey is set. Choose one in Settings > Global hotkeys.")
+            for key, action in self._tile_actions.items():
+                item = by_id.get(action)
+                tile = self._tiles.get(key)
+                if tile is not None:
+                    tile.set_hotkey(item["text"] if item and item["bound"] else "No hotkey")
+
+        self.update_when_shown("hotkeys", apply)
 
     def set_lite(self, lite: bool) -> None:
         """Lite mode: hover and selection colours switch at once instead of fading (every fade frame is Python painting)."""

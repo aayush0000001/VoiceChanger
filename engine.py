@@ -21,6 +21,7 @@ from ctypes import wintypes
 import importlib.util
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -28,6 +29,8 @@ import tracemalloc
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
+
+import hotkeys as hk
 
 # NumPy and SciPy start a BLAS thread pool per logical CPU and reserve about 60 MB of address space for each: over 700 MB
 # of committed memory on a 12-core PC, for nothing, because the DSP only handles 256-sample vectors, which BLAS never
@@ -172,6 +175,7 @@ class AppConfig:
     enable_onnx: bool = False
     lite_mode: bool = False          # for older PCs: slower meters, no fades or Mica, memory trimmed while hidden
     stability_buffer: bool = False   # asks Windows for a bigger audio buffer: fewer dropouts, a little more delay
+    hotkeys: Dict[str, str] = field(default_factory=hk.default_bindings)  # action id -> "Ctrl+Alt+F1" ("" = Not set)
     current_params: VoiceParameters = field(
         default_factory=lambda: VoiceParameters(**asdict(TACTICAL_PRESETS["Deep Shadow (Omen)"]))
     )
@@ -1172,71 +1176,218 @@ def run_audio_path_test(
 
 class Win32HotkeyListener(threading.Thread):
     """
-    Uses standard Win32 RegisterHotKey inside a dedicated OS message pump.
-    Does NOT install WH_KEYBOARD_LL hooks, guaranteeing 0% CPU idle overhead
-    and 100% Riot Vanguard compliance.
+    Global hotkeys through the Win32 RegisterHotKey API inside one dedicated OS message pump. It installs no
+    WH_KEYBOARD_LL hook (it sees nothing but the combinations it registered, costs no CPU while idle and stays inside
+    what Riot Vanguard accepts) and adds MOD_NOREPEAT, so holding a combination fires it once.
 
-    ``callback_fn(hotkey_id)`` is called on this listener thread; hand the id to your UI thread from there.
-    ``registered`` maps each hotkey id to whether Windows accepted it (another app may already own it).
+    ``bindings`` maps each hotkey id to ``(modifiers, virtual key)`` or None (Not set); the default is the factory set.
+    ``callback_fn(hotkey_id)`` is called on this thread for every press: hand the id to your UI thread from there.
+
+    Windows ties a registration to the thread that made it, so every RegisterHotKey / UnregisterHotKey call is made on
+    this thread. Other threads change the bindings with ``apply`` / ``suspend`` / ``resume``: each queues a command and
+    wakes the pump without waiting, and the outcome comes back through ``on_result(dict)``, also called on this thread
+    (emit a Qt signal from it): ``{"token", "kind", "suspended", "table", "registered", "errors", "reverted"}``.
+    A change Windows refuses (another program owns the combination) is put back to the previous combination, and its
+    id is listed in ``reverted``. ``registered`` maps each bound hotkey id to whether Windows accepts it right now.
     """
 
     WM_HOTKEY = 0x0312
     WM_QUIT = 0x0012
+    WM_COMMANDS = 0x8001  # WM_APP + 1: commands are waiting in the queue
     MOD_ALT = 0x0001
     MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
     MOD_NOREPEAT = 0x4000
+    ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 
-    HK_PRESET_1 = 101  # Ctrl + Alt + F1
+    HK_PRESET_1 = 101  # Ctrl + Alt + F1 by default
     HK_PRESET_2 = 102  # Ctrl + Alt + F2
     HK_PRESET_3 = 103  # Ctrl + Alt + F3
     HK_PRESET_4 = 104  # Ctrl + Alt + F4
     HK_BYPASS   = 105  # Ctrl + Alt + F9
     HK_MUTE     = 106  # Ctrl + Alt + F10
 
-    def __init__(self, callback_fn):
-        super().__init__(daemon=True)
+    @staticmethod
+    def default_table() -> Dict[int, Optional[Tuple[int, int]]]:
+        return hk.to_table(hk.default_bindings())
+
+    def __init__(self, callback_fn, bindings: Optional[Dict[int, Optional[Tuple[int, int]]]] = None, on_result=None):
+        super().__init__(daemon=True, name="vcomms-hotkeys")
         self.callback_fn = callback_fn
+        self.on_result = on_result
         self.thread_id: Optional[int] = None
         self.running = True
         self.registered: Dict[int, bool] = {}
-        self.ready = threading.Event()  # set once every RegisterHotKey call has returned
+        self.errors: Dict[int, int] = {}                 # last Win32 error per hotkey id that Windows refused
+        self.ready = threading.Event()                   # set once the first registrations have been attempted
+        self._wanted: Dict[int, Optional[Tuple[int, int]]] = dict(
+            bindings if bindings is not None else self.default_table()
+        )
+        self._active: Dict[int, Tuple[int, int]] = {}    # what Windows currently has registered for this thread
+        self._suspended = False
+        self._commands: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
+        self._owner: Optional[int] = None
+        self._user32 = None
+
+    # ---- any thread ----------------------------------------------------------------------------------------
+    def apply(self, bindings: Dict[int, Optional[Tuple[int, int]]], token=None, resume: bool = False) -> None:
+        """Makes the registrations match ``bindings`` (``resume`` also ends a suspension)."""
+        self._post(("apply", token, dict(bindings), resume))
+
+    def suspend(self, token=None) -> None:
+        """Unregisters everything (the bindings are remembered), so the combinations reach whoever is listening."""
+        self._post(("suspend", token))
+
+    def resume(self, token=None) -> None:
+        self._post(("resume", token))
+
+    def stop(self) -> None:
+        self.running = False
+        if sys.platform == "win32" and self.thread_id is not None and self._user32 is not None:
+            self._user32.PostThreadMessageW(self.thread_id, self.WM_QUIT, 0, 0)
+
+    def _post(self, command: tuple) -> None:
+        self._commands.put(command)  # before looking at thread_id: run() drains the queue once it is up
+        if sys.platform == "win32" and self.thread_id is not None and self._user32 is not None:
+            self._user32.PostThreadMessageW(self.thread_id, self.WM_COMMANDS, 0, 0)
+
+    # ---- this thread only ----------------------------------------------------------------------------------
+    def _register(self, hk_id: int, combo: Tuple[int, int]) -> int:
+        """0 when Windows accepted the combination, otherwise its Win32 error code."""
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("hotkeys must be registered on the listener thread")
+        mods, vk = combo
+        if self._user32.RegisterHotKey(None, hk_id, mods | self.MOD_NOREPEAT, vk):
+            self._active[hk_id] = combo
+            self.errors.pop(hk_id, None)
+            return 0
+        error = ctypes.get_last_error() or 1
+        self.errors[hk_id] = error
+        return error
+
+    def _unregister(self, hk_id: int) -> None:
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("hotkeys must be unregistered on the listener thread")
+        if self._active.pop(hk_id, None) is not None:
+            self._user32.UnregisterHotKey(None, hk_id)
+
+    def _sync(self) -> Dict[int, int]:
+        """Brings the registrations in line with ``_wanted`` (none while suspended). Everything that changes is
+        unregistered before anything new is registered, so two actions can swap combinations. Returns the Win32 error
+        for every combination Windows refused."""
+        refused: Dict[int, int] = {}
+        for hk_id in list(self._active):
+            if self._suspended or self._active[hk_id] != self._wanted.get(hk_id):
+                self._unregister(hk_id)
+        if not self._suspended:
+            for hk_id, combo in self._wanted.items():
+                if combo is not None and hk_id not in self._active:
+                    error = self._register(hk_id, combo)
+                    if error:
+                        refused[hk_id] = error
+        return refused
+
+    def _apply(self, table, resume: bool) -> Tuple[Dict[int, int], List[int]]:
+        previous = dict(self._wanted)
+        if resume:
+            self._suspended = False
+        for hk_id, entry in table.items():
+            self._wanted[hk_id] = tuple(entry) if entry else None
+        refused = self._sync()
+        reverted: List[int] = []
+        for hk_id in refused:
+            if previous.get(hk_id) != self._wanted.get(hk_id):  # a change Windows refused: keep what worked before
+                self._wanted[hk_id] = previous.get(hk_id)
+                reverted.append(hk_id)
+                if previous.get(hk_id) is not None:
+                    self._register(hk_id, previous[hk_id])
+        return refused, reverted
+
+    def _publish(self, token, kind: str, refused: Dict[int, int], reverted: List[int]) -> None:
+        if not self._suspended:  # while suspended nothing is registered on purpose: that is not "taken by another app"
+            self.registered = {i: (i in self._active) for i, combo in self._wanted.items() if combo is not None}
+        if self.on_result is None:
+            return
+        try:
+            self.on_result(
+                {
+                    "token": token,
+                    "kind": kind,
+                    "suspended": self._suspended,
+                    "table": dict(self._wanted),
+                    "registered": dict(self.registered),
+                    "errors": dict(refused),
+                    "reverted": list(reverted),
+                }
+            )
+        except Exception:
+            pass  # the listener must outlive a bug in the receiver
+
+    def _run_commands(self) -> None:
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            kind, token = command[0], command[1]
+            if kind == "apply":
+                refused, reverted = self._apply(command[2], command[3])
+            elif kind == "suspend":
+                self._suspended = True
+                refused, reverted = self._sync(), []
+            else:  # resume
+                self._suspended = False
+                refused, reverted = self._sync(), []
+            self._publish(token, kind, refused, reverted)
 
     def run(self) -> None:
         if sys.platform != "win32":
             self.ready.set()
             return
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        self.thread_id = kernel32.GetCurrentThreadId()
-
-        mods = self.MOD_CONTROL | self.MOD_ALT | self.MOD_NOREPEAT
-        bindings = {
-            self.HK_PRESET_1: (mods, 0x70),  # VK_F1
-            self.HK_PRESET_2: (mods, 0x71),  # VK_F2
-            self.HK_PRESET_3: (mods, 0x72),  # VK_F3
-            self.HK_PRESET_4: (mods, 0x73),  # VK_F4
-            self.HK_BYPASS:   (mods, 0x78),  # VK_F9
-            self.HK_MUTE:     (mods, 0x79),  # VK_F10
-        }
-
-        for hk_id, (mod, vk) in bindings.items():
-            self.registered[hk_id] = bool(user32.RegisterHotKey(None, hk_id, mod, vk))
-        self.ready.set()
+        user32 = self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.PeekMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+        ]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        self._owner = threading.get_ident()
 
         msg = wintypes.MSG()
-        while self.running and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        user32.PeekMessageW(ctypes.byref(msg), None, 0x0400, 0x0400, 0)  # creates this thread's message queue first
+        self.thread_id = int(kernel32.GetCurrentThreadId())
+
+        refused = self._sync()
+        self._publish(None, "startup", refused, [])
+        self.ready.set()
+        self._run_commands()  # anything queued before the pump existed
+
+        while self.running:
+            status = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if status == 0 or status == -1:
+                break
             if msg.message == self.WM_HOTKEY:
-                self.callback_fn(int(msg.wParam))
+                try:
+                    self.callback_fn(int(msg.wParam))
+                except Exception:
+                    pass
+            elif msg.message == self.WM_COMMANDS:
+                self._run_commands()
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-        for hk_id in bindings:
-            user32.UnregisterHotKey(None, hk_id)
-
-    def stop(self) -> None:
-        self.running = False
-        if sys.platform == "win32" and self.thread_id is not None:
-            ctypes.windll.user32.PostThreadMessageW(self.thread_id, self.WM_QUIT, 0, 0)
+        for hk_id in list(self._active):
+            self._unregister(hk_id)
 
 
 # ============================================================================
@@ -1267,11 +1418,14 @@ def load_profile_into(config: AppConfig, path: Path) -> bool:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         params_raw = raw.pop("current_params", None)
+        hotkeys_raw = raw.pop("hotkeys", None)
         for k, v in raw.items():
             if hasattr(config, k):
                 setattr(config, k, v)
         if params_raw:
             config.current_params = VoiceParameters(**params_raw)
+        if isinstance(hotkeys_raw, dict):  # a profile from before hotkeys could be changed has none: keep the current ones
+            config.hotkeys = hk.normalize_bindings(hotkeys_raw)
         return True
     except Exception:
         return False

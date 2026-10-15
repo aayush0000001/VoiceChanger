@@ -206,6 +206,11 @@ class MainWindow(FluentWindow):
         sv.profileSaveRequested.connect(b.save_profile)
         sv.profileLoadRequested.connect(b.load_profile)
         sv.resetAllRequested.connect(b.reset_all)
+        sv.hotkeyCaptureRequested.connect(b.begin_hotkey_capture)
+        sv.hotkeyChosen.connect(b.change_hotkey)
+        sv.hotkeyCleared.connect(b.clear_hotkey)
+        sv.hotkeyCaptureCancelled.connect(b.cancel_hotkey_capture)
+        sv.hotkeysRestoreRequested.connect(b.restore_default_hotkeys)
         sv.reportRequested.connect(self.request_report)
         self.reportPrepareRequested.connect(b.prepare_report)
         self.reportSubmitRequested.connect(b.submit_report)
@@ -236,6 +241,8 @@ class MainWindow(FluentWindow):
         b.onnx_changed.connect(sv.apply_onnx)
         b.profile_changed.connect(sv.apply_profile)
         b.hotkeys_changed.connect(sv.apply_hotkeys)
+        b.hotkeys_changed.connect(lv.apply_hotkeys)
+        b.hotkey_capture_ready.connect(sv.begin_hotkey_listening)
         b.notify.connect(self.show_notification)
         b.report_ready.connect(self.open_report_dialog)
         b.report_finished.connect(self.on_report_finished)
@@ -468,7 +475,7 @@ class MainWindow(FluentWindow):
         self.hide()
         self.tray.showMessage(
             f"{APP_NAME} is still running",
-            "Meters are paused. Hotkeys (Ctrl+Alt+F1..F4, F9, F10) stay active.",
+            "Meters are paused. Your hotkeys stay active.",
             QSystemTrayIcon.MessageIcon.Information,
             2000,
         )

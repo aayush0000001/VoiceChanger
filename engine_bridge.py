@@ -16,6 +16,7 @@ thread reads them (``AudioEngineManager.read_telemetry``) and emits ``status_upd
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import re
 import shutil
 import threading
@@ -28,12 +29,14 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 import applog
 import diagnostics
 import engine as eng
+import hotkeys as hk
 import presets as pr
 import reporting
 
 TELEMETRY_INTERVAL_MS = 33      # ~30 Hz meters and latency readout
 LITE_TELEMETRY_INTERVAL_MS = 100  # Lite mode: 10 Hz is plenty for the numbers and bars, and a third of the painting
 PARAM_FLUSH_INTERVAL_MS = 25    # slider drags are coalesced to at most ~40 snapshot rebuilds per second
+HOTKEY_CAPTURE_TIMEOUT_MS = 15000  # safety net: hotkeys are switched off while a new one is being picked, never for longer
 
 BLOCK_SIZES = (128, 256, 512)
 DEVICE_ROLES = ("input", "output", "monitor")
@@ -48,7 +51,12 @@ PRESET_META = {
     "Cybernetic Agent (KAY/O)": ("Phase-continuous 58 Hz ring modulator with a shifted vocal tract.", "ROBOT"),
     "Pitch Clean (Up / Helium-Lite)": ("Clean upward pitch and formant shift. No grit.", "UP"),
 }
-DEFAULT_HOTKEY_PREFIX = "Ctrl + Alt + "
+
+# The Settings rows of the two switch hotkeys (the four preset hotkeys are described by the presets they select).
+SWITCH_HOTKEYS = {
+    "bypass": ("Bypass toggle", "Instant passthrough to your raw natural voice.", "SPEED_OFF"),
+    "mute": ("Hardware mute toggle", "Zero-fills the output buffer instantly.", "MUTE"),
+}
 
 
 def _split_preset_name(name: str):
@@ -88,13 +96,15 @@ class EngineBridge(QObject):
     path_test_finished = pyqtSignal(object)    # {"passed": bool, "steps": [{"status", "stage", "text"}]}
     onnx_changed = pyqtSignal(object)     # {"available", "enabled", "path", "message"}
     profile_changed = pyqtSignal(object)  # {"path": str, "autoloaded": bool}
-    hotkeys_changed = pyqtSignal(object)  # {hotkey id: registered}
+    hotkeys_changed = pyqtSignal(object)  # {"items": [{id, text, bound, registered, conflict}], "all_default": bool}
+    hotkey_capture_ready = pyqtSignal(str)  # action id: every hotkey is switched off, so the page can listen for keys
     notify = pyqtSignal(object)           # {"level": success|info|warning|error, "title": str, "text": str}
     report_ready = pyqtSignal(object)     # {"diagnostics": str, "wait_s": int, "sending": bool}: the form can be opened
     report_finished = pyqtSignal(object)  # reporting.submit() result: sent | fallback | rate_limited
 
     # ---- internal (emitted from other threads, delivered on the bridge thread) -------------------------------
     _hotkey_pressed = pyqtSignal(int)
+    _hotkey_result = pyqtSignal(object)   # the listener thread's answer to apply / suspend / resume
     _path_test_done = pyqtSignal(object)
     _report_done = pyqtSignal(object)
     _shutdown_requested = pyqtSignal()
@@ -106,6 +116,7 @@ class EngineBridge(QObject):
         self.moveToThread(self._thread)
         self._thread.started.connect(self._initialize)
         self._hotkey_pressed.connect(self._on_hotkey)
+        self._hotkey_result.connect(self._on_hotkey_result)
         self._path_test_done.connect(self._on_path_test_done)
         self._report_done.connect(self._on_report_done)
         self._shutdown_requested.connect(self._shutdown)
@@ -113,6 +124,13 @@ class EngineBridge(QObject):
         self.config: eng.AppConfig = eng.AppConfig()
         self.engine: Optional[eng.AudioEngineManager] = None
         self._hotkeys: Optional[eng.Win32HotkeyListener] = None
+        self._hk_registered: Dict[str, Optional[bool]] = {}   # action id -> does Windows accept its combination?
+        self._hk_conflicts: Dict[str, str] = {}               # action id -> why the last change was refused
+        self._hk_pending: Dict[int, dict] = {}                # command token -> what to do with the answer
+        self._hk_tokens = itertools.count(1)
+        self._hk_suspended = False                            # a hotkey is being picked: nothing is registered
+        self._hk_baseline: Dict[str, str] = hk.default_bindings()  # what is on disk (or was loaded at start)
+        self._hk_watchdog: Optional[QTimer] = None
         self._inputs: List = []
         self._outputs: List = []
         self._selected: Dict[str, Optional[int]] = {r: None for r in DEVICE_ROLES}
@@ -144,6 +162,10 @@ class EngineBridge(QObject):
     def _initialize(self) -> None:
         cfg = self.config
         self._profile_autoloaded = self._profile_path.is_file() and eng.load_profile_into(cfg, self._profile_path)
+        saved = hk.load_store()
+        if saved is not None:
+            cfg.hotkeys = saved  # the player's last choice in Settings wins over the hotkeys inside the startup profile
+        self._hk_baseline = dict(cfg.hotkeys)
         self.engine = eng.AudioEngineManager(cfg)
         self._library.load()
         # so a preset hotkey (or a click on a saved preset) never has to design filters mid-game
@@ -165,9 +187,13 @@ class EngineBridge(QObject):
             self.engine.dsp.update_parameters(cfg.current_params)
         self._scan_devices()
 
-        self._hotkeys = eng.Win32HotkeyListener(self._hotkey_pressed.emit)
+        self._hk_watchdog = QTimer(self)
+        self._hk_watchdog.setSingleShot(True)
+        self._hk_watchdog.setInterval(HOTKEY_CAPTURE_TIMEOUT_MS)
+        self._hk_watchdog.timeout.connect(self._hotkey_capture_timed_out)
+        # RegisterHotKey runs on the listener thread; the answer arrives as _hotkey_result
+        self._hotkeys = eng.Win32HotkeyListener(self._hotkey_pressed.emit, hk.to_table(cfg.hotkeys), self._hotkey_result.emit)
         self._hotkeys.start()
-        QTimer.singleShot(250, self._publish_hotkey_state)  # RegisterHotKey runs on the listener thread
 
         self.catalog_ready.emit(self._catalog())
         self._publish_everything()
@@ -178,7 +204,7 @@ class EngineBridge(QObject):
 
     @pyqtSlot()
     def _shutdown(self) -> None:
-        for timer in (self._flush_timer, self._telemetry_timer):
+        for timer in (self._flush_timer, self._telemetry_timer, self._hk_watchdog):
             if timer is not None:
                 timer.stop()
         if self._hotkeys is not None:
@@ -191,18 +217,30 @@ class EngineBridge(QObject):
     # payloads
     # ======================================================================================================
 
+    def _preset_hotkey(self, n: int):
+        """(action id, chip text) of the hotkey that selects built-in preset number ``n``; none for presets past the
+        fourth, which have no hotkey."""
+        action = f"preset_{n}"
+        if action not in hk.ACTION_BY_ID:
+            return None, ""
+        serial = self.config.hotkeys.get(action, "")
+        return action, (hk.combo_text(serial) if serial else "No hotkey")
+
     def _preset_items(self) -> List[dict]:
-        """Tile data: the four built-ins (Ctrl+Alt+F1..F4), then the player's own presets in the order they made them."""
+        """Tile data: the built-ins (their hotkeys are the ones set in Settings, Ctrl+Alt+F1..F4 at first), then the
+        player's own presets in the order they made them."""
         items = []
         for n, name in enumerate(eng.TACTICAL_PRESETS, start=1):
             title, tag = _split_preset_name(name)
             blurb, icon = PRESET_META.get(name, ("", "MICROPHONE"))
+            action, chip = self._preset_hotkey(n)
             items.append(
                 {
                     "key": name,
                     "title": title,
                     "tag": tag,
-                    "hotkey": f"{DEFAULT_HOTKEY_PREFIX}F{n}",
+                    "hotkey": chip,
+                    "hotkey_action": action,
                     "blurb": blurb,
                     "icon": icon,
                     "custom": False,
@@ -215,6 +253,7 @@ class EngineBridge(QObject):
                     "title": name,
                     "tag": "Custom",
                     "hotkey": "Custom",
+                    "hotkey_action": None,
                     "blurb": _summary(params),
                     "icon": "TAG",
                     "custom": True,
@@ -231,40 +270,45 @@ class EngineBridge(QObject):
             return eng.preset_parameters(name)
         return self._library.get(name)
 
-    def _catalog(self) -> dict:
-        hotkeys = []
-        for n, name in enumerate(eng.TACTICAL_PRESETS, start=1):
-            title, _tag = _split_preset_name(name)
-            blurb, icon = PRESET_META.get(name, ("", "MICROPHONE"))
-            hotkeys.append(
+    def _action_label(self, action_id: str) -> str:
+        """How a hotkey is named on screen: the preset it selects, or what it toggles."""
+        if action_id in SWITCH_HOTKEYS:
+            return SWITCH_HOTKEYS[action_id][0]
+        if action_id.startswith("preset_"):
+            n = int(action_id.split("_")[1])
+            names = list(eng.TACTICAL_PRESETS)
+            if n <= len(names):
+                return f"Preset: {_split_preset_name(names[n - 1])[0]}"
+        action = hk.ACTION_BY_ID.get(action_id)
+        return action.label if action else action_id
+
+    def _hotkey_rows(self) -> List[dict]:
+        """One Settings row per hotkey action, in the order of ``hotkeys.ACTIONS``."""
+        names = list(eng.TACTICAL_PRESETS)
+        rows = []
+        for action in hk.ACTIONS:
+            if action.id in SWITCH_HOTKEYS:
+                label, detail, icon = SWITCH_HOTKEYS[action.id]
+            else:
+                n = int(action.id.split("_")[1])
+                if n > len(names):
+                    continue
+                blurb, icon = PRESET_META.get(names[n - 1], ("", "MICROPHONE"))
+                label, detail = self._action_label(action.id), blurb
+            rows.append(
                 {
-                    "id": getattr(eng.Win32HotkeyListener, f"HK_PRESET_{n}", None),
-                    "keys": f"{DEFAULT_HOTKEY_PREFIX}F{n}",
-                    "action": f"Preset: {title}",
-                    "detail": blurb,
+                    "id": action.id,
+                    "action": label,
+                    "detail": detail,
                     "icon": icon,
+                    "default_text": hk.combo_text(action.default),
                 }
             )
-        hotkeys.append(
-            {
-                "id": eng.Win32HotkeyListener.HK_BYPASS,
-                "keys": f"{DEFAULT_HOTKEY_PREFIX}F9",
-                "action": "Bypass toggle",
-                "detail": "Instant passthrough to your raw natural voice.",
-                "icon": "SPEED_OFF",
-            }
-        )
-        hotkeys.append(
-            {
-                "id": eng.Win32HotkeyListener.HK_MUTE,
-                "keys": f"{DEFAULT_HOTKEY_PREFIX}F10",
-                "action": "Hardware mute toggle",
-                "detail": "Zero-fills the output buffer instantly.",
-                "icon": "MUTE",
-            }
-        )
+        return rows
+
+    def _catalog(self) -> dict:
         return {
-            "hotkeys": hotkeys,
+            "hotkeys": self._hotkey_rows(),
             "block_sizes": [
                 {"samples": b, "ms": b / self.config.sample_rate * 1000.0} for b in BLOCK_SIZES
             ],
@@ -350,6 +394,7 @@ class EngineBridge(QObject):
         self.devices_changed.emit(self._devices_payload())
         self.engine_state_changed.emit(self._engine_payload())
         self.onnx_changed.emit(self._onnx_payload())
+        self._publish_hotkeys()
         self.profile_changed.emit(
             {"path": str(self._profile_path.resolve()) if self._profile_autoloaded else "",
              "autoloaded": self._profile_autoloaded}
@@ -691,6 +736,8 @@ class EngineBridge(QObject):
                 problems.append(f"{pr.LIBRARY_FILENAME} could not be updated ({exc.strerror or exc})")
         self._scan_devices(refresh=not running)
         self._apply_lite()
+        self._hk_conflicts.clear()                      # the defaults came back with the loop above
+        self._hotkey_commit(persist=True, restored=True)
         if self._profile_path.is_file():                # the file that is loaded on every start
             try:
                 eng.save_profile(cfg, self._profile_path)
@@ -727,18 +774,165 @@ class EngineBridge(QObject):
         elif hk_id == listener.HK_MUTE:
             self.set_flag("mic_muted", not self.config.mic_muted)
 
-    def _publish_hotkey_state(self) -> None:
+    def _hotkeys_payload(self) -> dict:
+        cfg = self.config
+        items = []
+        for action in hk.ACTIONS:
+            serial = cfg.hotkeys.get(action.id, "")
+            items.append(
+                {
+                    "id": action.id,
+                    "text": hk.combo_text(serial),
+                    "bound": bool(serial),
+                    "registered": self._hk_registered.get(action.id) if serial else None,
+                    "conflict": self._hk_conflicts.get(action.id, ""),
+                }
+            )
+        return {"items": items, "all_default": hk.normalize_bindings(cfg.hotkeys) == hk.default_bindings()}
+
+    def _publish_hotkeys(self) -> None:
+        self.hotkeys_changed.emit(self._hotkeys_payload())
+
+    # ---- changing a hotkey -----------------------------------------------------------------------------------
+    # The Settings page asks for a capture first: every registration is dropped (a registered combination never
+    # reaches the page, it would fire its action instead), then the page listens, and ends with one of change /
+    # clear / cancel, which put the registrations back. All RegisterHotKey calls happen on the listener thread; this
+    # thread only queues commands and reads the answers, so neither the GUI nor the audio thread ever waits for them.
+
+    def _hotkey_command(self, **context) -> int:
+        token = next(self._hk_tokens)
+        self._hk_pending[token] = context
+        return token
+
+    def _hotkey_commit(self, **context) -> None:
+        """Sends the bindings in ``config.hotkeys`` to the listener thread (and ends any capture)."""
+        self._hk_watchdog.stop()
+        self._hk_suspended = False
         if self._hotkeys is None:
             return
-        registered = dict(self._hotkeys.registered)
-        self.hotkeys_changed.emit(registered)
-        taken = sum(1 for ok in registered.values() if not ok)
-        if taken:
+        context["requested"] = dict(self.config.hotkeys)
+        self._hotkeys.apply(hk.to_table(self.config.hotkeys), self._hotkey_command(**context), resume=True)
+
+    def _resume_hotkeys(self) -> None:
+        self._hk_watchdog.stop()
+        if self._hotkeys is not None and self._hk_suspended:
+            self._hk_suspended = False
+            self._hotkeys.resume(self._hotkey_command())
+
+    @pyqtSlot(str)
+    def begin_hotkey_capture(self, action_id: str) -> None:
+        if self._hotkeys is None or action_id not in hk.ACTION_BY_ID:
+            return
+        self._hk_suspended = True
+        self._hk_watchdog.start()
+        self._hotkeys.suspend(self._hotkey_command(capture=action_id))
+
+    @pyqtSlot()
+    def cancel_hotkey_capture(self) -> None:
+        self._resume_hotkeys()
+
+    def _hotkey_capture_timed_out(self) -> None:
+        if self._hk_suspended:
+            applog.get_logger().warning("A hotkey capture was left open; the hotkeys were switched back on")
+            self._resume_hotkeys()
+
+    @pyqtSlot(str, int, int)
+    def change_hotkey(self, action_id: str, mods: int, vk: int) -> None:
+        if action_id not in hk.ACTION_BY_ID:
+            self._resume_hotkeys()
+            return
+        combo = hk.Combo(mods, vk)
+        try:
+            warning = hk.validate_combo(self.config.hotkeys, action_id, combo, self._action_label)
+        except hk.HotkeyError as exc:
+            self._notify("error", f"Couldn't change {self._action_label(action_id)}", exc.message)
+            self._resume_hotkeys()
+            self._publish_hotkeys()
+            return
+        self.config.hotkeys[action_id] = combo.serial()
+        self._hk_conflicts.pop(action_id, None)
+        self._hotkey_commit(action=action_id, persist=True, warning=warning)
+
+    @pyqtSlot(str)
+    def clear_hotkey(self, action_id: str) -> None:
+        if action_id not in hk.ACTION_BY_ID:
+            self._resume_hotkeys()
+            return
+        self.config.hotkeys[action_id] = ""
+        self._hk_conflicts.pop(action_id, None)
+        self._hotkey_commit(action=action_id, persist=True)
+
+    @pyqtSlot()
+    def restore_default_hotkeys(self) -> None:
+        self.config.hotkeys = hk.default_bindings()
+        self._hk_conflicts.clear()
+        self._hotkey_commit(persist=True, restored=True)
+
+    @pyqtSlot(object)
+    def _on_hotkey_result(self, result: dict) -> None:
+        """The listener thread's answer. Its table is the truth about what is bound now: a change Windows refused
+        (another program owns the combination) has been put back on the previous combination there."""
+        context = self._hk_pending.pop(result.get("token"), None) or {}
+        kind = result["kind"]
+        if kind == "suspend":
+            if "capture" in context and self._hk_suspended:
+                self.hotkey_capture_ready.emit(context["capture"])
+            return
+        cfg = self.config
+        for action in hk.ACTIONS:
+            if action.hk_id in result["table"]:
+                cfg.hotkeys[action.id] = hk.from_table_entry(result["table"][action.hk_id])
+        registered = result["registered"]
+        self._hk_registered = {a.id: registered.get(a.hk_id) for a in hk.ACTIONS}
+
+        requested = context.get("requested", {})
+        for hk_id in result["reverted"]:
+            action = hk.ACTION_BY_HK_ID[hk_id]
+            label = self._action_label(action.id)
+            tried, kept = hk.combo_text(requested.get(action.id, "")), hk.combo_text(cfg.hotkeys.get(action.id, ""))
+            error = result["errors"].get(hk_id, 0)
+            why = (
+                "another program already uses it"
+                if error == eng.Win32HotkeyListener.ERROR_HOTKEY_ALREADY_REGISTERED
+                else f"Windows refused it (error {error})"
+            )
+            self._hk_conflicts[action.id] = f"{tried} is used by another program. Still {kept}."
+            self._notify("error", f"Couldn't use {tried} for {label}", f"{why[0].upper()}{why[1:]}. {label} stays {kept}.")
+            applog.get_logger().warning("Hotkey %s: %s refused (error %s); kept %s", action.id, tried, error, kept)
+
+        if kind == "startup":
+            bound = [ok for ok in registered.values()]
+            taken = sum(1 for ok in bound if not ok)
+            if taken:
+                self._notify(
+                    "warning",
+                    "Some hotkeys are unavailable",
+                    f"{taken} of {len(bound)} are used by another app, maybe a second V-COMMS. See Settings.",
+                )
+        warning, changed = context.get("warning"), context.get("action")
+        if warning and changed and changed not in {hk.ACTION_BY_HK_ID[i].id for i in result["reverted"]}:
+            now = hk.combo_text(cfg.hotkeys.get(changed, ""))
+            self._notify("warning", f"{self._action_label(changed)} is now {now}", warning)
+        if context.get("persist"):
+            self._persist_hotkeys()
+        self._publish_hotkeys()
+
+    def _persist_hotkeys(self) -> None:
+        """Saves the bindings the moment they change, so a restart keeps them without saving a profile."""
+        cfg = self.config
+        if cfg.hotkeys == self._hk_baseline:
+            return
+        try:
+            hk.save_store(cfg.hotkeys)
+        except OSError as exc:
+            applog.get_logger().warning("Hotkeys could not be saved: %s", exc)
             self._notify(
                 "warning",
-                "Some hotkeys are unavailable",
-                f"{taken} of {len(registered)} are used by another app, maybe a second V-COMMS. See Settings.",
+                "Couldn't save your hotkeys",
+                f"{hk.store_path()} could not be written ({exc.strerror or exc}). They work until you quit V-COMMS.",
             )
+            return
+        self._hk_baseline = dict(cfg.hotkeys)
 
     # ======================================================================================================
     # audio path test
@@ -800,6 +994,7 @@ class EngineBridge(QObject):
 
     @pyqtSlot(str)
     def load_profile(self, path: str) -> None:
+        hotkeys_before = dict(self.config.hotkeys)
         if not eng.load_profile_into(self.config, Path(path)):
             self._notify("error", "Couldn't load the profile", f"{Path(path).name} is not a valid V-COMMS profile.")
             return
@@ -807,6 +1002,9 @@ class EngineBridge(QObject):
         self._scan_devices()
         self._apply_lite()
         self.engine.dsp.update_parameters(self.config.current_params)
+        if self.config.hotkeys != hotkeys_before:       # the profile carries its own hotkeys
+            self._hk_conflicts.clear()
+            self._hotkey_commit(persist=True)
         self._publish_everything()
         self.profile_changed.emit({"path": str(Path(path).resolve()), "autoloaded": False})
         self._notify("success", "Profile loaded", Path(path).name)

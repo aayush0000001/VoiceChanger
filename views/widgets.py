@@ -5,8 +5,18 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, List, Optional
 
-from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QContextMenuEvent, QFont, QFontMetrics, QKeyEvent, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -32,6 +42,7 @@ from qfluentwidgets import (
     InfoBarIcon,
     InfoBarPosition,
     MenuAnimationType,
+    PushButton,
     RoundMenu,
     ScrollArea,
     Slider,
@@ -46,6 +57,7 @@ from qfluentwidgets import (
     themeColor,
 )
 
+import hotkeys
 from styles import (
     CARD_PADDING,
     CARD_RADIUS,
@@ -405,6 +417,11 @@ class Chip(QWidget):
         self.setFixedWidth(max(self._min_width, QFontMetrics(self._font).horizontalAdvance(text) + 16))
         self.update()
 
+    def setAccent(self, accent: bool) -> None:
+        if accent != self._accent:
+            self._accent = accent
+            self.update()
+
     def paintEvent(self, e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -424,6 +441,190 @@ class Chip(QWidget):
         p.setPen(fg)
         p.setFont(self._font)
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+
+
+class HotkeyEditor(QWidget):
+    """
+    The right-hand side of a hotkey row in Settings: whether Windows accepts the combination, the combination as a
+    chip and a Change button. Change first asks the window to switch every hotkey off (a registered combination never
+    reaches a window, it would run its action instead); when that is done ``listen()`` is called and the next
+    combination is read here. Esc cancels, Backspace or Delete clears the hotkey ("Not set"). Clicking another control,
+    switching windows, hiding the page or waiting ten seconds cancels as well, so hotkeys are never left switched off.
+    """
+
+    captureRequested = pyqtSignal(str)             # action id: please switch the hotkeys off
+    combinationChosen = pyqtSignal(str, int, int)  # action id, modifier bits (hotkeys.MOD_*), virtual-key code
+    cleared = pyqtSignal(str)
+    cancelled = pyqtSignal(str)
+
+    LISTEN_MS = 10000
+    _MODIFIER_BITS = {
+        Qt.Key.Key_Control: hotkeys.MOD_CONTROL,
+        Qt.Key.Key_Alt: hotkeys.MOD_ALT,
+        Qt.Key.Key_AltGr: hotkeys.MOD_CONTROL | hotkeys.MOD_ALT,
+        Qt.Key.Key_Shift: hotkeys.MOD_SHIFT,
+        Qt.Key.Key_Meta: hotkeys.MOD_WIN,
+    }
+
+    def __init__(self, action_id: str, label: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.action_id = action_id
+        self._text = "Not set"
+        self._waiting = False     # Change was pressed and the window has not said the hotkeys are off yet
+        self._listening = False   # the next combination is read here
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.LISTEN_MS)
+        self._timer.timeout.connect(self.cancel)
+
+        self.status = CaptionLabel("")
+        self.status.setFixedWidth(132)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.chip = Chip("Not set", min_width=128)
+        self.button = PushButton("Change")
+        self.button.setFixedWidth(88)
+        self.button.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # a click must not steal the focus the capture is about to use
+        self.button.setAccessibleName(f"Change the hotkey for {label}")
+        self.button.clicked.connect(self._button_clicked)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAccessibleName(f"{label} hotkey")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(GAP_SM + 4)
+        lay.addWidget(self.status)
+        lay.addWidget(self.chip)
+        lay.addWidget(self.button)
+
+    # ---- state from the engine ----------------------------------------------------------------------------
+    def set_state(self, text: str, bound: bool, registered: Optional[bool]) -> None:
+        """``text`` is the combination ('Not set' when cleared); ``registered`` is whether Windows accepted it."""
+        self._text = text
+        if not self._listening:
+            self.chip.setText(text)
+        if not bound or registered is None:
+            self.status.setText("")
+            self.status.setToolTip("")
+        elif registered:
+            self.status.setText("Active")
+            self.status.setTextColor(success_color(), success_color())
+            self.status.setToolTip("")
+        else:
+            self.status.setText("In use by another app")
+            self.status.setTextColor(danger_color(), danger_color())
+            self.status.setToolTip(
+                "Windows refused this shortcut because another program already uses it. "
+                "That can be a second copy of V-COMMS: check the tray."
+            )
+
+    @property
+    def active(self) -> bool:
+        return self._waiting or self._listening
+
+    # ---- capture --------------------------------------------------------------------------------------------
+    def _button_clicked(self) -> None:
+        if self.active:
+            self.cancel()
+            return
+        self._waiting = True
+        self.button.setText("Cancel")
+        self._timer.start()
+        self.captureRequested.emit(self.action_id)
+
+    def listen(self) -> None:
+        """Every hotkey is off: read the next combination."""
+        if not self._waiting:
+            return
+        self._waiting, self._listening = False, True
+        self.chip.setText("Press the new keys")
+        self.chip.setAccent(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._timer.start()
+
+    def cancel(self) -> None:
+        """Ends the capture without changing anything (and tells the window, which switches the hotkeys back on)."""
+        if self.active:
+            self._finish()
+            self.cancelled.emit(self.action_id)
+
+    def _finish(self) -> None:
+        self._waiting = self._listening = False
+        self._timer.stop()
+        self.chip.setAccent(False)
+        self.chip.setText(self._text)
+        self.button.setText("Change")
+        if self.hasFocus():
+            self.button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    @staticmethod
+    def _modifier_bits(modifiers) -> int:
+        bits = 0
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            bits |= hotkeys.MOD_CONTROL
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            bits |= hotkeys.MOD_ALT
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            bits |= hotkeys.MOD_SHIFT
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            bits |= hotkeys.MOD_WIN
+        return bits
+
+    def _preview(self, mods: int) -> None:
+        held = hotkeys.mod_names(mods)
+        self.chip.setText(" + ".join(held + ("…",)) if held else "Press the new keys")
+
+    def event(self, e) -> bool:
+        if self._listening and e.type() == QEvent.Type.ShortcutOverride:
+            e.accept()  # the key is for the capture, not for a shortcut of the window
+            return True
+        if self._listening and e.type() == QEvent.Type.KeyPress:
+            self.keyPressEvent(e)  # also Tab, which would otherwise move the focus away
+            return True
+        return super().event(e)
+
+    def keyPressEvent(self, e: QKeyEvent) -> None:
+        if not self._listening:
+            super().keyPressEvent(e)
+            return
+        e.accept()
+        if e.isAutoRepeat():
+            return
+        mods = self._modifier_bits(e.modifiers())
+        key = e.key()
+        if key in self._MODIFIER_BITS:
+            self._preview(mods | self._MODIFIER_BITS[key])
+        elif key == Qt.Key.Key_Escape:
+            self.cancel()
+        elif key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and not (mods & hotkeys.MODIFIERS):
+            self._finish()
+            self.cleared.emit(self.action_id)
+        else:
+            self._finish()
+            self.combinationChosen.emit(self.action_id, mods, int(e.nativeVirtualKey()))
+
+    def keyReleaseEvent(self, e: QKeyEvent) -> None:
+        if self._listening and e.key() in self._MODIFIER_BITS:
+            held = self._modifier_bits(QGuiApplication.queryKeyboardModifiers())
+            self._preview(held & ~self._MODIFIER_BITS[e.key()])
+            e.accept()
+        else:
+            super().keyReleaseEvent(e)
+
+    def focusOutEvent(self, e) -> None:
+        super().focusOutEvent(e)
+        if self._listening:
+            self.cancel()
+
+    def changeEvent(self, e) -> None:
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.ActivationChange and self.active and not self.isActiveWindow():
+            self.cancel()
+
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self.cancel()
 
 
 class StatusPill(QWidget):
@@ -771,6 +972,7 @@ class PresetTile(CardWidget):
         super().__init__(parent)
         self.key = key
         self.custom = custom
+        self._title = title
         self._menu: Optional[RoundMenu] = None
         self.setBorderRadius(CARD_RADIUS)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -779,6 +981,7 @@ class PresetTile(CardWidget):
         self.setAccessibleName(f"{title}, custom voice preset" if custom else f"{title} voice preset, {hotkey}")
 
         self.keyChip = Chip(hotkey, accent=custom)
+        self.keyChip.setVisible(bool(hotkey))
         self.iconWidget = IconWidget(icon)
         self.iconWidget.setFixedSize(20, 20)
         self.titleLabel = ElidedStrongLabel(title)
@@ -820,6 +1023,7 @@ class PresetTile(CardWidget):
         lay.addStretch(1)
 
         self.clicked.connect(self._emit)
+        self.set_hotkey(hotkey)
 
     # ------------------------------------------------------------------ the "..." menu of a custom tile
     def _build_menu(self) -> RoundMenu:
@@ -849,6 +1053,20 @@ class PresetTile(CardWidget):
 
     def _emit(self) -> None:
         self.chosen.emit(self.key)
+
+    def set_hotkey(self, text: str) -> None:
+        """The chip on a built-in tile shows the hotkey set in Settings ('No hotkey' once it is cleared)."""
+        if self.custom:
+            return
+        self.keyChip.setText(text)
+        self.keyChip.setVisible(bool(text))
+        self.setAccessibleName(f"{self._title} voice preset" + (f", {text}" if text else ""))
+        if not text:
+            self.setToolTip("")
+        elif text == "No hotkey":
+            self.setToolTip("No hotkey is set for this voice. Choose one in Settings > Global hotkeys.")
+        else:
+            self.setToolTip(f"Hotkey: {text}. You can change it in Settings > Global hotkeys.")
 
     def set_selected(self, selected: bool) -> None:
         if selected == self._selected:

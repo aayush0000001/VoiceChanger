@@ -104,7 +104,7 @@ Then on the **Live** page:
 
 All hotkeys work in fullscreen VALORANT with zero hook injection:
 
-| Global Hotkey | Action / Preset |
+| Default hotkey | Action / Preset |
 | :--- | :--- |
 | `Ctrl + Alt + F1` | **Deep Shadow (Omen)** — Sub-harmonic pitch/formant drop + dark spatializer |
 | `Ctrl + Alt + F2` | **Tactical Comms (Radio)** — Tight band-pass (420Hz–2.9kHz) + Pade overdrive crunch |
@@ -113,12 +113,14 @@ All hotkeys work in fullscreen VALORANT with zero hook injection:
 | `Ctrl + Alt + F9` | **Bypass Toggle** — Instant passthrough to your raw natural voice |
 | `Ctrl + Alt + F10` | **Hardware Mute Toggle** — Zero-fill output buffer instantly |
 
+These are the defaults. Change any of them in **Settings > Global hotkeys**: press *Change*, then the new keys (`Esc` cancels, `Backspace` or `Delete` clears the hotkey, *Restore defaults* brings them all back). The new combination works at once, with the window hidden, and is kept between runs in `%APPDATA%\V-COMMS\hotkeys.json`; *Save JSON Profile* stores the hotkeys in the profile too, and *Reset all settings* restores the defaults. Hotkeys stay keyboard-only `RegisterHotKey` registrations (no hooks, no mouse buttons). Letters, digits, `Space` and the arrow, `Insert`, `Delete`, `Home`, `End` and `Page` keys need `Ctrl`, `Alt` or `Shift`; `F1`-`F11`, `F13`-`F24` and the numpad can stand alone; `F12` is reserved by Windows. A registered combination is taken away from every program, the game included, so avoid a lone `Shift` or `Ctrl` with a letter or digit (VALORANT walks with `Shift` and crouches with `Ctrl`): V-COMMS warns you about that.
+
 ---
 
 ## Presets, Reset, Performance and Support
 
-* **Custom presets:** **Voice > Presets > Save as preset** keeps your current sliders under your own name (up to 24). They sit next to the four built-in voices on the **Live** page, each with a `...` menu to rename, export or delete it; `Ctrl + Alt + F1`-`F4` stay on the built-ins. Presets are shared as small `.json` files (*Import preset*): the file is read as plain data, limited to 64 KB, and every value is clamped to its slider's range. They are stored in `custom_presets.json` next to the profile file.
-* **Reset all settings** (Settings > Reset) restores the first-launch effects, switches, devices, buffer size and theme and rewrites the auto-loaded profile. Custom presets are kept unless you tick *Also delete my custom presets*.
+* **Custom presets:** **Voice > Presets > Save as preset** keeps your current sliders under your own name (up to 24). They sit next to the four built-in voices on the **Live** page, each with a `...` menu to rename, export or delete it; the four hotkeys (`Ctrl + Alt + F1`-`F4` by default) stay on the built-ins. Presets are shared as small `.json` files (*Import preset*): the file is read as plain data, limited to 64 KB, and every value is clamped to its slider's range. They are stored in `custom_presets.json` next to the profile file.
+* **Reset all settings** (Settings > Reset) restores the first-launch effects, switches, devices, buffer size, hotkeys and theme and rewrites the auto-loaded profile. Custom presets are kept unless you tick *Also delete my custom presets*.
 * **Lite mode** and **Stability buffer** (Settings > Performance) are for older or busy PCs: Lite mode uses slower meters, no fades or Mica, and hands memory back to Windows while the window is hidden; the Stability buffer asks the audio drivers for a bigger buffer (fewer dropouts, a little more delay; Settings shows how many ms on your devices).
 * **Report a problem** (Settings > Support) sends a bug, glitch or idea. You see the exact text, diagnostics included, before anything leaves your PC. To receive reports, put your Formspree form address in `report_config.py`; until then the report is copied to the clipboard.
 

@@ -7,13 +7,13 @@ import sysconfig
 from typing import Dict, Optional
 
 from PyQt6.QtCore import QT_VERSION_STR, PYQT_VERSION_STR, Qt, pyqtSignal
-from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QWidget
+from PyQt6.QtWidgets import QFileDialog, QWidget
 from qfluentwidgets import BodyLabel, CaptionLabel, ComboBox, FluentIcon, PushButton, SwitchButton
 import qfluentwidgets
 
-from styles import GAP_SM, danger_color, success_color
+from styles import GAP_SM, danger_color
 from .dialogs import ConfirmDialog
-from .widgets import Card, Chip, GroupCard, PageBase, icon_by_name, muted, set_switch
+from .widgets import Card, Chip, GroupCard, HotkeyEditor, PageBase, icon_by_name, muted, set_switch
 
 THEMES = (("Use system setting", "auto"), ("Light", "light"), ("Dark", "dark"))
 
@@ -28,12 +28,17 @@ class SettingsView(PageBase):
     resetAllRequested = pyqtSignal(bool)        # also delete the custom presets? (the window resets the look itself)
     reportRequested = pyqtSignal()              # open the problem report form (the window builds it)
     quitRequested = pyqtSignal()                # (handled by the window itself)
+    hotkeyCaptureRequested = pyqtSignal(str)    # action id: switch every hotkey off so the next key press can be read
+    hotkeyChosen = pyqtSignal(str, int, int)    # action id, modifier bits, virtual-key code
+    hotkeyCleared = pyqtSignal(str)             # action id: back to "Not set"
+    hotkeyCaptureCancelled = pyqtSignal()       # nothing was picked: switch the hotkeys back on
+    hotkeysRestoreRequested = pyqtSignal()      # every hotkey back to its default
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__("settingsView", "Settings", "Appearance, hotkeys, profiles and experimental features.", parent)
         self._applying = False
         self._profile_file = "tactical_voice_profile.json"
-        self._hotkey_rows: Dict[int, tuple] = {}
+        self._hotkey_rows: Dict[str, tuple] = {}   # action id -> (row, editor, its normal description)
 
         # ---- appearance ----------------------------------------------------------------------------
         self.add_section("Appearance")
@@ -84,6 +89,16 @@ class SettingsView(PageBase):
         self.add_section("Global hotkeys")
         self.hotkeyCard = GroupCard("Work in fullscreen VALORANT, no keyboard hook")
         self.content.addWidget(self.hotkeyCard)
+        self.hotkeyNote = muted(
+            CaptionLabel(
+                "Keyboard only. V-COMMS takes a combination over from every program, the game included, while it runs. "
+                "Letters, digits, Space and the arrow, Insert, Delete, Home, End and Page keys need Ctrl, Alt or Shift; "
+                "F1 to F11, F13 to F24 and the numpad (with Num Lock on) can stand alone. F12 is reserved by Windows. "
+                "Esc cancels a change, Backspace or Delete clears a hotkey."
+            )
+        )
+        self.hotkeyNote.setWordWrap(True)
+        self.content.addWidget(self.hotkeyNote)
 
         # ---- profile -----------------------------------------------------------------------------------
         self.add_section("Profile")
@@ -93,7 +108,7 @@ class SettingsView(PageBase):
         self.saveButton.clicked.connect(self._save_profile)
         self.loadButton.clicked.connect(self._load_profile)
         self.profileCard.add_row(
-            FluentIcon.SAVE, "Save your setup", "Voice settings, devices and buffer size.", self.saveButton
+            FluentIcon.SAVE, "Save your setup", "Voice settings, devices, buffer size and hotkeys.", self.saveButton
         )
         self.loadRow = self.profileCard.add_row(
             FluentIcon.DOCUMENT, "Load a profile", "tactical_voice_profile.json is loaded on startup.", self.loadButton
@@ -201,8 +216,8 @@ class SettingsView(PageBase):
         dialog = ConfirmDialog(
             self.window(),
             "Reset all settings?",
-            "Voice effects, switches, devices, buffer size and the theme go back to how they were on first launch, "
-            "and your startup profile is rewritten with those defaults. Your custom presets are kept.",
+            "Voice effects, switches, devices, buffer size, hotkeys and the theme go back to how they were on first "
+            "launch, and your startup profile is rewritten with those defaults. Your custom presets are kept.",
             "Reset",
             checkbox_text="Also delete my custom presets",
         )
@@ -240,33 +255,54 @@ class SettingsView(PageBase):
         self.modelButton.setEnabled(data["onnx_available"])
         if not data["onnx_available"]:
             self.aiSwitchRow.contentLabel.setText("onnxruntime is not installed, so this is unavailable.")
-        for hk in data["hotkeys"]:
-            chip = Chip(hk["keys"], min_width=128)
-            status = CaptionLabel("")
-            status.setFixedWidth(132)
-            status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            host = QWidget()
-            lay = QHBoxLayout(host)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(GAP_SM + 4)
-            lay.addWidget(status)
-            lay.addWidget(chip)
-            row = self.hotkeyCard.add_row(icon_by_name(hk["icon"], FluentIcon.SETTING), hk["action"], hk["detail"], host)
-            if hk["id"] is not None:
-                self._hotkey_rows[hk["id"]] = (status, row)
-
-    def apply_hotkeys(self, registered: dict) -> None:
-        for hk_id, (status, _row) in self._hotkey_rows.items():
-            ok = registered.get(hk_id)
-            if ok is None:
-                continue
-            color = success_color() if ok else danger_color()
-            status.setText("Active" if ok else "In use by another app")
-            status.setTextColor(color, color)
-            status.setToolTip(
-                "" if ok else "Windows refused this shortcut because another program already uses it. "
-                "That can be a second copy of V-COMMS: check the tray."
+        for hotkey in data["hotkeys"]:
+            editor = HotkeyEditor(hotkey["id"], hotkey["action"])
+            editor.captureRequested.connect(self._capture_requested)
+            editor.combinationChosen.connect(self.hotkeyChosen)
+            editor.cleared.connect(self.hotkeyCleared)
+            editor.cancelled.connect(lambda _id: self.hotkeyCaptureCancelled.emit())
+            row = self.hotkeyCard.add_row(
+                icon_by_name(hotkey["icon"], FluentIcon.SETTING), hotkey["action"], hotkey["detail"], editor
             )
+            self._hotkey_rows[hotkey["id"]] = (row, editor, hotkey["detail"])
+        self.restoreHotkeysButton = PushButton(FluentIcon.HISTORY, "Restore defaults")
+        self.restoreHotkeysButton.clicked.connect(self.hotkeysRestoreRequested)
+        self.hotkeyCard.add_row(
+            FluentIcon.HISTORY,
+            "Restore default hotkeys",
+            "Ctrl + Alt + F1 to F4 select the first four voices, F9 toggles bypass and F10 toggles mute.",
+            self.restoreHotkeysButton,
+        )
+
+    def _capture_requested(self, action_id: str) -> None:
+        for other_id, (_row, editor, _detail) in self._hotkey_rows.items():
+            if other_id != action_id:
+                editor.cancel()           # only one hotkey is picked at a time
+        self.hotkeyCaptureRequested.emit(action_id)
+
+    def begin_hotkey_listening(self, action_id: str) -> None:
+        """The engine has switched the hotkeys off: the row that asked can now read the next key press."""
+        entry = self._hotkey_rows.get(action_id)
+        if entry is not None:
+            entry[1].listen()
+
+    def apply_hotkeys(self, data: dict) -> None:
+        def apply() -> None:
+            for item in data["items"]:
+                entry = self._hotkey_rows.get(item["id"])
+                if entry is None:
+                    continue
+                row, editor, detail = entry
+                editor.set_state(item["text"], item["bound"], item["registered"])
+                conflict = item["conflict"]
+                row.contentLabel.setText(conflict or detail)
+                if conflict:   # the combination was refused: the row says so until the next change
+                    row.contentLabel.setTextColor(danger_color(), danger_color())
+                else:
+                    muted(row.contentLabel)
+            self.restoreHotkeysButton.setEnabled(not data["all_default"])
+
+        self.update_when_shown("hotkeys", apply)
 
     def apply_flags(self, flags: dict) -> None:
         def apply() -> None:
