@@ -1,13 +1,24 @@
 # V-COMMS // Real-Time Low-Latency Tactical Voice Engine (Windows 11)
 
-![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+[![Download Executable](https://img.shields.io/badge/Download-Standalone%20EXE-2ea44f?style=for-the-badge&logo=windows)](https://github.com/aayush0000001/VoiceChanger/releases/latest)
 ![Platform Windows 11](https://img.shields.io/badge/Platform-Windows%2011%20(WASAPI)-0078D6?logo=windows)
 ![Latency ~19ms](https://img.shields.io/badge/Est.%20Roundtrip%20Latency-~19ms-00F5D4)
 ![Vanguard Safe](https://img.shields.io/badge/Riot%20Vanguard-100%25%20Compliant-FF4655)
 
-**V-COMMS** is a lightweight, wait-free real-time DSP and ONNX voice conversion desktop application engineered for tactical gaming voice chat (**VALORANT**, **Discord**, **OBS Studio**) on Windows 11.
+**V-COMMS** is a lightweight, wait-free real-time DSP voice conversion desktop application engineered for tactical gaming voice chat (**VALORANT**, **Discord**, **OBS Studio**) on Windows 11.
 
-Built to operate strictly at the OS audio-routing layer via **Windows WASAPI**, it targets **~19 ms estimated roundtrip latency** at 256 samples / 48 kHz (two buffers + DSP time + ~6 ms driver allowance, as shown in the app's status bar) and pins itself to the last two logical cores, which are the Efficiency Cores (E-Cores) on Intel hybrid CPUs.
+---
+
+## ⚡ Quick Start for Users (No Python Needed!)
+
+If you just want to use the voice changer without installing Python or programming dependencies:
+
+1. **Download the Executable:**
+   👉 Go to **[Latest Releases](https://github.com/aayush0000001/VoiceChanger/releases/latest)** and download **`V-COMMS.exe`**.
+2. **Install VB-CABLE:**
+   Download and install the free [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) (reboot if prompted).
+3. **Run the App:**
+   Double-click **`V-COMMS.exe`** to start.
 
 ---
 
@@ -23,33 +34,31 @@ Built to operate strictly at the OS audio-routing layer via **Windows WASAPI**, 
 
 ---
 
-## Prerequisites
+## Developer / Source Installation
 
-1. **Operating System:** Windows 11 (64-bit)
-2. **Python:** Python 3.10 or newer (tested on 3.13)
-3. **Virtual Audio Device:** [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) (Free)
+If you want to run or modify the code directly from source:
 
----
+### 1. Prerequisites
+- **Operating System:** Windows 11 (64-bit)
+- **Python:** Python 3.10 or newer (tested on 3.11–3.13)
+- **Virtual Audio Device:** [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/)
 
-## Quick Start Installation
-
-### 1. Clone the Repository & Create a Virtual Environment
+### 2. Clone & Setup Virtual Environment
 ```powershell
-git clone https://github.com/<your-username>/v-comms-voice-engine.git
-cd v-comms-voice-engine
+git clone https://github.com/aayush0000001/VoiceChanger.git
+cd VoiceChanger
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 2. Run the Automated Self-Test & Latency Benchmark
-Verify that all DSP stages, lock-free buffers, and real-time deadlines pass on your hardware before launching the GUI:
+### 3. Run Self-Test & Benchmark
 ```powershell
 python val_voice_changer.py --self-test
 ```
 
-### 3. Launch the Application
+### 4. Launch the GUI
 ```powershell
 python val_voice_changer.py
 ```
@@ -91,12 +100,6 @@ Then on the **Live** page:
 
 ---
 
-> **Note on the ONNX AI engine (experimental):** `onnxruntime-directml` is optional; the app runs without it. The model is fed the last 4096 samples as a single `1 x 4096` float32 input and runs inside the audio callback, so most real voice-conversion models (e.g. RVC) will not work as-is.
-
-> **Profiles:** On startup the app auto-loads `tactical_voice_profile.json` from the folder it is launched from, if present. Use **Save JSON Profile** with that name to make it your default.
-
----
-
 ## Global In-Game Hotkeys
 
 All hotkeys work in fullscreen VALORANT with zero hook injection:
@@ -112,13 +115,13 @@ All hotkeys work in fullscreen VALORANT with zero hook injection:
 
 ---
 
-## Compiling a Standalone `.exe` (Optional Deployment)
+## Compiling Standalone `.exe` Locally
 
-To package V-COMMS into a standalone Windows executable using **PyInstaller**:
+To package V-COMMS manually using **PyInstaller**:
 
 ```powershell
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name "V-COMMS" val_voice_changer.py
+pyinstaller --noconsole --onefile --name "V-COMMS" --collect-all qfluentwidgets val_voice_changer.py
 ```
 The compiled executable will be generated in `dist\V-COMMS.exe`.
 
