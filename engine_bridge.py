@@ -916,6 +916,13 @@ class EngineBridge(QObject):
             bound = [ok for ok in registered.values()]
             taken = sum(1 for ok in bound if not ok)
             if taken:
+                held = ", ".join(
+                    f"{hk.ACTION_BY_HK_ID[i].id} {hk.combo_text(cfg.hotkeys.get(hk.ACTION_BY_HK_ID[i].id, ''))} "
+                    f"(error {result['errors'].get(i, '?')})"
+                    for i, ok in registered.items()
+                    if not ok
+                )
+                applog.get_logger().warning("Hotkeys another program holds, not registered at start: %s", held)
                 self._notify(
                     "warning",
                     "Some hotkeys are unavailable",
