@@ -516,6 +516,13 @@ class ONNXVoiceStreamer:
 # 3. WAIT-FREE REAL-TIME DSP PIPELINE
 # ============================================================================
 
+# Filter designs shared by every DSP chain. The ones the built-in presets need are pinned at start-up (see
+# prewarm_filter_designs); designs made while a slider is dragged go into a small cache that is emptied when it fills.
+_PINNED_DESIGNS: Dict[tuple, np.ndarray] = {}
+_SWEEP_DESIGNS: Dict[tuple, np.ndarray] = {}
+_SWEEP_DESIGN_LIMIT = 64
+
+
 class RealTimeDSPChain:
     """
     Lock-Free Real-Time Audio Pipeline.
@@ -543,27 +550,33 @@ class RealTimeDSPChain:
         self._scratch_b = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
         self._time_steps = np.arange(MAX_BLOCK_SIZE, dtype=np.float32) / float(sample_rate)
 
-        # Filter designs already computed for the control thread (see _cached_design)
-        self._design_cache: Dict[tuple, np.ndarray] = {}
-
         # Atomic RCU snapshot pointer
         self._snapshot: DSPImmutableSnapshot = self._compile_snapshot(VoiceParameters())
 
-    def _cached_design(self, key: tuple, build: Callable[[], np.ndarray]) -> np.ndarray:
+    def _cached_design(
+        self, key: tuple, build: Callable[[], np.ndarray], pin: bool = False
+    ) -> np.ndarray:
         """
         Designing a filter with scipy costs several milliseconds (roughly 2 ms each here, under x64 emulation
         on ARM64), and holds the GIL the whole time. Reuse earlier results so a control that does not touch a
         filter (pitch, reverb, drive, ring mod, ...) never redesigns it while the audio thread is running.
         The audio thread only reads these arrays, so sharing them between snapshots is safe.
         """
-        sos = self._design_cache.get(key)
+        key = (self.sr,) + key
+        sos = _PINNED_DESIGNS.get(key)
         if sos is None:
-            if len(self._design_cache) >= 48:
-                self._design_cache.clear()
-            sos = self._design_cache[key] = build()
+            sos = _SWEEP_DESIGNS.get(key)
+        if sos is None:
+            sos = build()
+            if pin:
+                _PINNED_DESIGNS[key] = sos
+            else:
+                if len(_SWEEP_DESIGNS) >= _SWEEP_DESIGN_LIMIT:
+                    _SWEEP_DESIGNS.clear()
+                _SWEEP_DESIGNS[key] = sos
         return sos
 
-    def _compile_snapshot(self, params: VoiceParameters) -> DSPImmutableSnapshot:
+    def _compile_snapshot(self, params: VoiceParameters, pin: bool = False) -> DSPImmutableSnapshot:
         """Runs on the UI thread to pre-calculate all float32 SOS matrices and scalar gains."""
         nyq = 0.5 * self.sr
         hpf_norm = float(np.clip(params.hpf_cutoff_hz / nyq, 0.001, 0.95))
@@ -572,10 +585,12 @@ class RealTimeDSPChain:
         hpf_sos = self._cached_design(
             ("hpf", hpf_norm),
             lambda: np.asarray(signal.butter(2, hpf_norm, btype="highpass", output="sos"), dtype=np.float32),
+            pin,
         )
         lpf_sos = self._cached_design(
             ("lpf", lpf_norm),
             lambda: np.asarray(signal.butter(2, lpf_norm, btype="lowpass", output="sos"), dtype=np.float32),
+            pin,
         )
 
         shift_factor = 2.0 ** (params.formant_semitones / 12.0)
@@ -587,7 +602,7 @@ class RealTimeDSPChain:
             b2, a2 = signal.iirpeak(f2_target / nyq, Q=3.0)
             return np.asarray(np.vstack([signal.tf2sos(b1, a1), signal.tf2sos(b2, a2)]), dtype=np.float32)
 
-        formant_sos = self._cached_design(("formant", f1_target, f2_target), design_formant)
+        formant_sos = self._cached_design(("formant", f1_target, f2_target), design_formant, pin)
 
         thresh_lin = float(10.0 ** (params.gate_threshold_db / 20.0))
         drive_gain = float(10.0 ** (params.drive_db / 20.0))
@@ -1137,6 +1152,16 @@ PROFILE_FILENAME = "tactical_voice_profile.json"  # auto-loaded from the folder 
 def preset_parameters(name: str) -> VoiceParameters:
     """A fresh, independent copy of a tactical preset's parameters."""
     return VoiceParameters(**asdict(TACTICAL_PRESETS[name]))
+
+
+def prewarm_filter_designs(sample_rate: int = 48000) -> None:
+    """
+    Designs the filters every built-in preset needs (a few ms each) while nothing is running, so switching
+    presets later, by hotkey in the middle of a match, only swaps a pointer instead of redesigning them.
+    """
+    chain = RealTimeDSPChain(sample_rate)
+    for params in TACTICAL_PRESETS.values():
+        chain._compile_snapshot(params, pin=True)
 
 
 def load_profile_into(config: AppConfig, path: Path) -> bool:

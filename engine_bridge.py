@@ -114,6 +114,7 @@ class EngineBridge(QObject):
         cfg = self.config
         self._profile_autoloaded = self._profile_path.is_file() and eng.load_profile_into(cfg, self._profile_path)
         self.engine = eng.AudioEngineManager(cfg)
+        eng.prewarm_filter_designs(cfg.sample_rate)  # so a preset hotkey never has to design filters mid-game
 
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)

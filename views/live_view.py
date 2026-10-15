@@ -39,6 +39,7 @@ class LiveView(PageBase):
 
         self._state = "stopped"
         self._busy = False
+        self._button_key = None
         self._tag = ""
         self._stats_at = 0.0
         self._tiles: Dict[str, PresetTile] = {}
@@ -169,17 +170,24 @@ class LiveView(PageBase):
         state = self._state
         if state == "running":
             self.statusPill.set_status(f"Live  ·  {self._tag}" if self._tag else "Live", "ok")
+        elif state == "starting":
+            self.statusPill.set_status("Starting…", "busy")
+        elif state == "error":
+            self.statusPill.set_status("Couldn't start", "error")
+        else:
+            self.statusPill.set_status("Stopped", "idle")
+
+        # a preset or mute change only re-words the pill; re-creating the button's icon is not free
+        key = (state, self._busy)
+        if key == self._button_key:
+            return
+        self._button_key = key
+        if state == "running":
             self.engineButton.setText("Stop audio engine")
             self.engineButton.setIcon(FluentIcon.PAUSE)
         elif state == "starting":
-            self.statusPill.set_status("Starting…", "busy")
             self.engineButton.setText("Starting…")
-        elif state == "error":
-            self.statusPill.set_status("Couldn't start", "error")
-            self.engineButton.setText("Start audio engine")
-            self.engineButton.setIcon(FluentIcon.PLAY)
         else:
-            self.statusPill.set_status("Stopped", "idle")
             self.engineButton.setText("Start audio engine")
             self.engineButton.setIcon(FluentIcon.PLAY)
         self.engineButton.setEnabled(state != "starting" and not self._busy)
