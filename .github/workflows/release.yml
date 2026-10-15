@@ -31,7 +31,7 @@ jobs:
 
       - name: Build standalone executable with PyInstaller
         run: |
-          pyinstaller --noconsole --onefile --name "V-COMMS" --collect-all qfluentwidgets val_voice_changer.py
+          pyinstaller --noconsole --onefile --name "V-COMMS" --icon app_icon.ico --collect-all qfluentwidgets val_voice_changer.py
 
       - name: Create Release and Upload Executable
         uses: softprops/action-gh-release@v2
@@ -40,7 +40,7 @@ jobs:
           name: V-COMMS ${{ github.ref_name }} - Standalone Windows Executable
           draft: false
           prerelease: false
-          tag_name: ${{ github.ref_name || 'v1.0.0' }}
+          tag_name: ${{ github.ref_name || 'v1.0.1' }}
           files: dist/V-COMMS.exe
           body: |
             # V-COMMS // Real-Time Tactical Voice Engine for Windows 11

@@ -117,11 +117,11 @@ All hotkeys work in fullscreen VALORANT with zero hook injection:
 
 ## Compiling Standalone `.exe` Locally
 
-To package V-COMMS manually using **PyInstaller**:
+To package V-COMMS manually using **PyInstaller** with the custom application icon:
 
 ```powershell
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name "V-COMMS" --collect-all qfluentwidgets val_voice_changer.py
+pyinstaller --noconsole --onefile --name "V-COMMS" --icon app_icon.ico --collect-all qfluentwidgets val_voice_changer.py
 ```
 The compiled executable will be generated in `dist\V-COMMS.exe`.
 
