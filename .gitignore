@@ -34,3 +34,9 @@ weights/
 
 # IDE & OS metadata
 .idea/
+
+# Git worktrees for side branches (packaging builds, experiments)
+.worktrees/
+
+# Screenshots and UI test captures
+screenshots/
