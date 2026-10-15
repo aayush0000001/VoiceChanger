@@ -478,7 +478,7 @@ class EngineBridge(QObject):
                 "load": peak / block_ms if block_ms else 0.0,
                 "roundtrip_ms": block_ms * 2.0 + t["dsp_ms"] + driver_ms,
                 "driver_ms": driver_ms,
-                "xruns": int(t["xruns"]),
+                "xruns": int(t["xruns"]) + int(t["stalls"]),   # "dropouts" on screen: the driver's flags plus real stalls
                 "tag": "MUTED" if cfg.mic_muted else ("BYPASS" if cfg.bypass_effects else cfg.active_preset),
             }
         )

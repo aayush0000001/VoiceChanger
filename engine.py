@@ -789,7 +789,11 @@ class AudioEngineManager:
         self.latest_out_db: float = -80.0
         self.latest_dsp_ms: float = 0.0
         self.peak_dsp_ms: float = 0.0   # slowest block since the last read_telemetry()
-        self.xruns: int = 0             # PortAudio under/overflow flags seen by the primary callback
+        self.xruns: int = 0             # PortAudio under/overflow flags seen by the primary callback (WASAPI never sets them)
+        # a callback that starts later than the stream's buffers can cover leaves a hole in the audio: that is a stall
+        self.stalls: int = 0
+        self._last_cb_t0: float = 0.0
+        self.stall_threshold_s: float = 0.040   # re-derived from the stream's own output buffer when it starts
         # totals since the engine was last started (for problem reports); three plain numbers, written by the callback
         self._dsp_blocks: int = 0
         self._dsp_total_ms: float = 0.0
@@ -810,6 +814,7 @@ class AudioEngineManager:
             "dsp_ms": self.latest_dsp_ms,
             "peak_dsp_ms": peak,
             "xruns": self.xruns,
+            "stalls": self.stalls,
         }
 
     def read_session_stats(self) -> Dict[str, float]:
@@ -820,7 +825,7 @@ class AudioEngineManager:
             "blocks": blocks,
             "mean_dsp_ms": self._dsp_total_ms / blocks if blocks else 0.0,
             "worst_dsp_ms": self._dsp_worst_ms,
-            "xruns": self.xruns,
+            "xruns": self.xruns + self.stalls,   # dropouts: the driver's flags plus real stalls
         }
 
     @staticmethod
@@ -861,6 +866,9 @@ class AudioEngineManager:
         t0 = time.perf_counter()
         if status:
             self.xruns += 1
+        last, self._last_cb_t0 = self._last_cb_t0, t0
+        if last and t0 - last > self.stall_threshold_s:
+            self.stalls += 1
 
         mono_in = indata[:, 0] if indata.ndim > 1 else indata
         in_rms = float(np.sqrt(np.dot(mono_in, mono_in) / float(max(frames, 1)) + 1e-12))
@@ -947,6 +955,8 @@ class AudioEngineManager:
             # same buffer as "low"): more headroom against a busy PC for a few tens of ms more delay.
             latency = STABILITY_LATENCY_S if self.config.stability_buffer else "low"
             self.xruns = 0
+            self.stalls = 0
+            self._last_cb_t0 = 0.0
             self.peak_dsp_ms = 0.0
             self._dsp_blocks = 0
             self._dsp_total_ms = 0.0
@@ -967,6 +977,10 @@ class AudioEngineManager:
                 self.stream_latency_ms = (float(lat[0]) * 1000.0, float(lat[1]) * 1000.0)
             except Exception:
                 self.stream_latency_ms = (0.0, 0.0)
+            if self.stream_latency_ms[1] > 0.0:
+                # measured on this PC: a hole starts once a stall passes about the output buffer; the gap between two
+                # callbacks also holds one ordinary period, so 90% of the buffer is where the alarm sounds
+                self.stall_threshold_s = max(0.025, 0.9 * self.stream_latency_ms[1] / 1000.0)
 
             if mon_idx is not None and mon_idx != out_idx:
                 mon_info = sd.query_devices(mon_idx)
