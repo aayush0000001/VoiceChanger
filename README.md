@@ -19,7 +19,7 @@ Built to operate strictly at the OS audio-routing layer via **Windows WASAPI**, 
   * **Power-of-Two Bitwise Pitch Shifter:** Dual-head rotating delay line ($2^{12} = 4096$ samples) using bitwise masking (`& 4095`), single-multiply fused linear interpolation, and the complementary Hann identity $y = v_B + g_A(v_A - v_B)$ with zero heap allocations per block.
   * **Wait-Free SPSC Monitor Ring Buffer:** Lock-free monotonic ring buffer ($2^{14} = 16384$ samples) with automatic clock-drift clamping for zero-lag *"Hear Myself"* side-tone monitoring.
   * **Zero-Roll 2x Mirrored ONNX Buffer:** Eliminates $\mathcal{O}(W)$ `np.roll` array copies during streaming AI inference by maintaining a double-length ($2W$) mirrored ring buffer that exposes $\mathcal{O}(1)$ C-contiguous views.
-* **Hybrid CPU Affinity Isolation:** Raises process priority to Above Normal and, on any PC with 8+ logical cores, pins the whole process to the final 2 logical cores. On Intel 12th–14th Gen hybrid CPUs these are E-Cores, leaving VALORANT the P-Cores; on AMD or non-hybrid CPUs they are ordinary cores. The 60Hz GUI telemetry timer also pauses when the window is closed to the system tray.
+* **Hybrid CPU Affinity Isolation:** Raises process priority to Above Normal and, on any PC with 8+ logical cores, pins the whole process to the final 2 logical cores. On Intel 12th–14th Gen hybrid CPUs these are E-Cores, leaving VALORANT the P-Cores; on AMD or non-hybrid CPUs they are ordinary cores. The 30Hz GUI telemetry timer also pauses when the window is closed to the system tray.
 
 ---
 
@@ -74,12 +74,16 @@ To prevent the Windows 11 Audio Graph from activating its internal sample-rate c
 ## Configuring V-COMMS & VALORANT
 
 ### Inside V-COMMS:
+On the **Devices** page:
 1. **Physical Mic Input:** Select your hardware microphone (`[Windows WASAPI]`).
 2. **Virtual Cable Output:** Select `CABLE Input (VB-Audio Virtual Cable) [Windows WASAPI]`.
-3. **Headphone Monitor:** Select your gaming headphones (`[Windows WASAPI]`). It must be a different device from the Virtual Cable Output, otherwise no monitor stream is opened. Tick **Hear Myself** to enable it.
+3. **Headphone Monitor:** Select your gaming headphones (`[Windows WASAPI]`). It must be a different device from the Virtual Cable Output, otherwise no monitor stream is opened. Turn on **Hear Myself** to enable it.
 4. **Buffer Size (@48kHz):** Select **256 samples (5.3 ms)**.
-5. Click **START AUDIO ENGINE**.
-6. *(Optional)* Close the window (`X`) to minimize V-COMMS to the Windows System Tray—this pauses the 60 FPS UI meters for zero GPU/DWM overhead while keeping hotkeys active.
+
+Then on the **Live** page:
+
+5. Click **Start audio engine**.
+6. *(Optional)* Close the window (`X`) to minimize V-COMMS to the Windows System Tray—this pauses the 30 FPS UI meters for zero GPU/DWM overhead while keeping hotkeys active.
 
 ### Inside VALORANT (and Discord / OBS):
 1. Open **VALORANT** -> **Settings** -> **Audio** -> **Voice Chat**.

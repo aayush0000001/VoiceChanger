@@ -1,0 +1,335 @@
+"""
+Fluent window shell: a FluentWindow with Mica, a collapsible navigation pane, the four pages, a tray icon and
+the wiring between the pages and the EngineBridge. All engine traffic goes through signals and slots.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from PyQt6.QtCore import QRectF, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+from qfluentwidgets import (
+    Action,
+    FluentIcon,
+    FluentWindow,
+    NavigationItemPosition,
+    SystemThemeListener,
+    SystemTrayMenu,
+    Theme,
+    isDarkTheme,
+    setTheme,
+    setThemeColor,
+)
+
+from engine_bridge import EngineBridge
+from views import DevicesView, LiveView, SettingsView, VoiceView
+from views.widgets import Toasts
+
+APP_NAME = "V-COMMS"
+THEME_KEYS = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
+MICA_MIN_BUILD = 22000  # Windows 11
+
+
+def mica_supported() -> bool:
+    return sys.platform == "win32" and sys.getwindowsversion().build >= MICA_MIN_BUILD
+
+
+def make_app_icon() -> QIcon:
+    """Rounded red square with a five-bar voice waveform, drawn at every size the shell asks for."""
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#FF4655"))
+        p.drawRoundedRect(QRectF(0, 0, size, size), size * 0.22, size * 0.22)
+        p.setBrush(QColor("#FFFFFF"))
+        heights = (0.30, 0.52, 0.72, 0.52, 0.30)
+        bar_w, gap = size * 0.09, size * 0.065
+        total = bar_w * len(heights) + gap * (len(heights) - 1)
+        x = (size - total) / 2
+        for h in heights:
+            bh = size * h
+            p.drawRoundedRect(QRectF(x, (size - bh) / 2, bar_w, bh), bar_w / 2, bar_w / 2)
+            x += bar_w + gap
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
+class MainWindow(FluentWindow):
+    # window -> bridge (the only way the shell talks to the engine besides the views' own signals)
+    engineToggleRequested = pyqtSignal()
+    telemetryActive = pyqtSignal(bool)
+
+    def __init__(self) -> None:
+        settings = QSettings(APP_NAME, APP_NAME)
+        saved_theme = str(settings.value("appearance/theme", "auto"))
+        if saved_theme not in THEME_KEYS:
+            saved_theme = "auto"
+        setTheme(THEME_KEYS[saved_theme])  # before any widget exists, so nothing flashes the wrong theme
+        accent = QGuiApplication.palette().color(QPalette.ColorRole.Accent)  # the Windows accent colour
+        setThemeColor(accent if accent.isValid() and accent.alpha() > 0 else QColor("#0078D4"))
+
+        super().__init__()
+        self.toasts = Toasts(self)
+        self.settings = settings
+        self._quitting = False
+        self._session_ending = False
+        self._engine_live = False
+        self._first_show = True
+        self._theme_key = saved_theme
+        self._mica_pref = settings.value("appearance/mica", True, type=bool)
+
+        self.bridge = EngineBridge()
+        self.themeListener = SystemThemeListener(self)
+        self.liveView = LiveView(self)
+        self.voiceView = VoiceView(self)
+        self.devicesView = DevicesView(self)
+        self.settingsView = SettingsView(self)
+
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(make_app_icon())
+        self.setMinimumSize(880, 620)
+        self._place_window()
+
+        self._init_navigation()
+        self._wire()
+        self._init_tray()
+        self._init_backdrop()
+
+        self.bridge.start()
+        self.themeListener.start()
+
+    # ------------------------------------------------------------------ construction
+    def _place_window(self) -> None:
+        geometry = self.settings.value("window/geometry")
+        if geometry is not None and self.restoreGeometry(geometry):
+            return
+        self.resize(1100, 780)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.center().x() - self.width() // 2, screen.center().y() - self.height() // 2)
+
+    def _init_navigation(self) -> None:
+        self.addSubInterface(self.liveView, FluentIcon.MICROPHONE, "Live")
+        self.addSubInterface(self.voiceView, FluentIcon.MIX_VOLUMES, "Voice")
+        self.addSubInterface(self.devicesView, FluentIcon.HEADPHONE, "Devices")
+        self.engineNavItem = self.navigationInterface.addItem(
+            routeKey="engineToggle",
+            icon=FluentIcon.POWER_BUTTON,
+            text="Start engine",
+            onClick=self._on_engine_nav_clicked,
+            selectable=False,
+            position=NavigationItemPosition.BOTTOM,
+            tooltip="Start or stop the audio engine",
+        )
+        self.addSubInterface(self.settingsView, FluentIcon.SETTING, "Settings", NavigationItemPosition.BOTTOM)
+        self.navigationInterface.setExpandWidth(220)
+        self.navigationInterface.setReturnButtonVisible(False)
+        self.stackedWidget.currentChanged.connect(self._sync_telemetry)
+
+    def _wire(self) -> None:
+        b, lv, vv, dv, sv = self.bridge, self.liveView, self.voiceView, self.devicesView, self.settingsView
+
+        # views -> bridge  (user intent; queued onto the bridge thread)
+        lv.engineToggleRequested.connect(b.toggle_engine)
+        self.engineToggleRequested.connect(b.toggle_engine)
+        lv.presetRequested.connect(b.apply_preset)
+        lv.flagToggled.connect(b.set_flag)
+        vv.paramChanged.connect(b.set_param)
+        vv.resetRequested.connect(b.reset_to_preset)
+        dv.deviceSelected.connect(b.select_device)
+        dv.blockSizeSelected.connect(b.set_block_size)
+        dv.rescanRequested.connect(b.rescan_devices)
+        dv.flagToggled.connect(b.set_flag)
+        dv.monitorVolumeChanged.connect(b.set_monitor_volume)
+        dv.pathTestRequested.connect(b.run_path_test)
+        sv.flagToggled.connect(b.set_flag)
+        sv.onnxModelSelected.connect(b.load_onnx_model)
+        sv.profileSaveRequested.connect(b.save_profile)
+        sv.profileLoadRequested.connect(b.load_profile)
+        self.telemetryActive.connect(b.set_telemetry_active)
+
+        # bridge -> views  (state; delivered on the GUI thread)
+        b.catalog_ready.connect(lv.set_catalog)
+        b.catalog_ready.connect(sv.set_catalog)
+        b.preset_changed.connect(lv.apply_preset)
+        b.preset_changed.connect(vv.apply_preset)
+        b.params_changed.connect(vv.apply_params)
+        b.flags_changed.connect(lv.apply_flags)
+        b.flags_changed.connect(dv.apply_flags)
+        b.flags_changed.connect(sv.apply_flags)
+        b.devices_changed.connect(dv.apply_devices)
+        b.engine_state_changed.connect(lv.apply_engine_state)
+        b.engine_state_changed.connect(dv.apply_engine_state)
+        b.engine_state_changed.connect(self.apply_engine_state)
+        b.status_updated.connect(lv.update_status)
+        b.path_test_state.connect(dv.apply_path_test_state)
+        b.path_test_state.connect(self.apply_path_test_state)
+        b.path_test_finished.connect(dv.show_path_test_result)
+        b.path_test_finished.connect(self.on_path_test_finished)
+        b.onnx_changed.connect(sv.apply_onnx)
+        b.profile_changed.connect(sv.apply_profile)
+        b.hotkeys_changed.connect(sv.apply_hotkeys)
+        b.notify.connect(self.show_notification)
+
+        # appearance is the window's own business (no engine involved)
+        sv.themeSelected.connect(self.set_theme)
+        sv.micaToggled.connect(self.set_mica)
+        sv.quitRequested.connect(self.quit_app)
+        self.themeListener.systemThemeChanged.connect(self._on_system_theme_changed)
+
+    def _init_tray(self) -> None:
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip(APP_NAME)
+        menu = SystemTrayMenu(parent=self)
+        menu.addAction(Action(FluentIcon.HOME, "Restore window", triggered=self.restore_from_tray))
+        menu.addSeparator()
+        menu.addAction(Action(FluentIcon.CLOSE, f"Exit {APP_NAME}", triggered=self.quit_app))
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _init_backdrop(self) -> None:
+        supported = mica_supported()
+        self.setMicaEffectEnabled(supported and self._mica_pref)  # solid theme background where Mica is unavailable
+        self.settingsView.apply_appearance(self._theme_key, supported, self._mica_pref)
+
+    # ------------------------------------------------------------------ appearance
+    def set_theme(self, key: str) -> None:
+        if key not in THEME_KEYS:
+            return
+        self._theme_key = key
+        self.settings.setValue("appearance/theme", key)
+        setTheme(THEME_KEYS[key])
+
+    def set_mica(self, enabled: bool) -> None:
+        self._mica_pref = enabled
+        self.settings.setValue("appearance/mica", enabled)
+        if mica_supported():
+            self.setMicaEffectEnabled(enabled)
+
+    def _on_system_theme_changed(self) -> None:
+        setTheme(Theme.AUTO)
+
+    def _onThemeChangedFinished(self) -> None:
+        super()._onThemeChangedFinished()
+        # DWM sometimes ignores the first re-application after a theme flip; the library's own demo retries too
+        if self.isMicaEffectEnabled():
+            QTimer.singleShot(100, lambda: self.windowEffect.setMicaEffect(self.winId(), isDarkTheme()))
+
+    # ------------------------------------------------------------------ slots
+    def _apply_animation_policy(self) -> None:
+        """Page transitions repaint a whole page for 300 ms, enough to delay a live audio block (measured), so they
+        only play while the audio engine is stopped."""
+        self.stackedWidget.setAnimationEnabled(not self._engine_live)
+
+    def apply_engine_state(self, data: dict) -> None:
+        running = data["state"] == "running"
+        self._engine_live = data["state"] in ("running", "starting")
+        self._apply_animation_policy()
+        self.engineNavItem.setText("Stop engine" if running else "Start engine")
+        self.engineNavItem.setIcon(FluentIcon.PAUSE if running else FluentIcon.POWER_BUTTON)
+        self.engineNavItem.setEnabled(data["state"] != "starting")
+        self.tray.setToolTip(f"{APP_NAME}  ·  {'live' if running else 'stopped'}")
+
+    def apply_path_test_state(self, data: dict) -> None:
+        self.liveView.set_busy(bool(data["running"]))
+        self.engineNavItem.setEnabled(not data["running"])
+
+    def on_path_test_finished(self, data: dict) -> None:
+        if data["passed"]:
+            self.show_notification({"level": "success", "title": "Audio path test passed", "text": ""})
+        else:
+            self.show_notification(
+                {"level": "error", "title": "Audio path test failed", "text": "Details are on the Devices page."}
+            )
+
+    def show_notification(self, data: dict) -> None:
+        level, title, text = data["level"], data["title"], data.get("text", "")
+        if not self.isVisible():
+            if level in ("error", "warning"):
+                self.tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Warning, 4000)
+            return
+        self.toasts.show(level, title, text, 8000 if level in ("error", "warning") else 4000)
+
+    def _on_engine_nav_clicked(self, *_args) -> None:
+        self.engineToggleRequested.emit()
+
+    # ------------------------------------------------------------------ tray & lifecycle
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.restore_from_tray()
+
+    def restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _sync_telemetry(self, *_args) -> None:
+        """The meters only run while the Live page is on screen; a hidden or minimized window, or another page,
+        costs the audio engine nothing (hotkeys and audio keep running regardless)."""
+        on_screen = (
+            self.isVisible() and not self.isMinimized() and self.stackedWidget.currentWidget() is self.liveView
+        )
+        self.telemetryActive.emit(on_screen)
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        toasts = getattr(self, "toasts", None)
+        if toasts is not None:
+            toasts.relayout()
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        if self._first_show:
+            self._first_show = False
+            QTimer.singleShot(0, lambda: self.navigationInterface.expand(useAni=False))  # labels visible by default
+        self._sync_telemetry()
+
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self._sync_telemetry()
+
+    def changeEvent(self, e) -> None:
+        super().changeEvent(e)
+        self._sync_telemetry()
+
+    def closeEvent(self, e) -> None:
+        if self._quitting or self._session_ending:
+            super().closeEvent(e)
+            return
+        # closing only hides the window: audio and hotkeys keep running from the tray
+        e.ignore()
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.hide()
+        self.tray.showMessage(
+            f"{APP_NAME} is still running",
+            "Meters are paused. Hotkeys (Ctrl+Alt+F1..F4, F9, F10) stay active.",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000,
+        )
+
+    def on_session_end(self, *_args) -> None:
+        """Windows is logging off or shutting down: let the window really close instead of vetoing the shutdown."""
+        self._session_ending = True
+
+    def shutdown_engine(self) -> None:
+        """Stops audio and hotkeys. Safe to call more than once; also wired to QApplication.aboutToQuit."""
+        self.themeListener.terminate()
+        self.themeListener.wait(500)
+        self.bridge.request_shutdown()
+
+    def quit_app(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.hide()
+        self.tray.hide()
+        self.shutdown_engine()
+        QApplication.quit()
