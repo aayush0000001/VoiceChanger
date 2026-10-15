@@ -26,8 +26,13 @@ from engine import configure_windows_process_isolation, run_production_self_test
 
 def build_gui():
     """Creates the QApplication and the main window (not shown yet). Returns ``(app, window)``."""
-    if sys.platform == "win32":
-        try:  # own taskbar identity (and icon) instead of python.exe's
+    # When running as a standalone frozen executable (PyInstaller), Windows already associates
+    # the process and taskbar icon directly with V-COMMS.exe. Calling SetCurrentProcessExplicitAppUserModelID
+    # with an unregistered custom string on an uninstalled portable executable tells Windows to search
+    # for a registered Shell Link, which causes the taskbar to show a blank/missing icon.
+    # Only set it when running from python.exe.
+    if sys.platform == "win32" and not getattr(sys, "frozen", False):
+        try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("V-COMMS.VoiceEngine")
         except Exception:
             pass
@@ -41,12 +46,16 @@ def build_gui():
     with contextlib.redirect_stdout(io.StringIO()):  # qfluentwidgets prints a promo banner when imported
         from qfluentwidgets import setFontFamilies
 
-        from main_window import MainWindow
+        from main_window import MainWindow, make_app_icon
 
     app = QApplication(sys.argv)
     app.setApplicationName("V-COMMS")
     app.setOrganizationName("V-COMMS")
     app.setQuitOnLastWindowClosed(False)  # closing the window hides it to the tray; Exit lives in the tray menu
+
+    # Set application icon immediately upon QApplication creation
+    app_icon = make_app_icon()
+    app.setWindowIcon(app_icon)
 
     # Windows 11's own UI font first, then the classic one
     setFontFamilies(["Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", "PingFang SC"])
@@ -58,7 +67,7 @@ def build_gui():
     app.setFont(base_font)
 
     window = MainWindow()
-    app.setWindowIcon(window.windowIcon())
+    window.setWindowIcon(app_icon)
     app.commitDataRequest.connect(window.on_session_end, Qt.ConnectionType.DirectConnection)  # logoff / shutdown
     app.aboutToQuit.connect(window.shutdown_engine)
     return app, window
@@ -67,6 +76,32 @@ def build_gui():
 def run_gui() -> int:
     app, window = build_gui()
     window.show()
+
+    # Explicitly set the native Win32 window icon handles on the HWND to ensure
+    # the taskbar button displays the icon under all Windows 11 shell states.
+    if sys.platform == "win32":
+        try:
+            hwnd = int(window.winId())
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+
+            h_instance = ctypes.windll.kernel32.GetModuleHandleW(None)
+            # PyInstaller embeds the primary icon as resource ID 1
+            h_icon_big = ctypes.windll.user32.LoadImageW(
+                h_instance, ctypes.c_wchar_p(1), 1, 0, 0, 0x0040 | 0x8000  # LR_DEFAULTSIZE | LR_SHARED
+            )
+            h_icon_small = ctypes.windll.user32.LoadImageW(
+                h_instance, ctypes.c_wchar_p(1), 1, 16, 16, 0x8000  # LR_SHARED
+            )
+
+            if h_icon_big:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_icon_big)
+            if h_icon_small:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_icon_small)
+        except Exception:
+            pass
+
     return app.exec()
 
 

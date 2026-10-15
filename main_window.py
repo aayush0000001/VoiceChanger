@@ -6,6 +6,7 @@ the wiring between the pages and the EngineBridge. All engine traffic goes throu
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PyQt6.QtCore import QRectF, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
@@ -38,6 +39,18 @@ def mica_supported() -> bool:
 
 def make_app_icon() -> QIcon:
     """Rounded red square with a five-bar voice waveform, drawn at every size the shell asks for."""
+    candidates = [
+        Path(getattr(sys, "_MEIPASS", "")) / "app_icon.ico",
+        Path(sys.executable).parent / "app_icon.ico",
+        Path(__file__).resolve().parent / "app_icon.ico",
+        Path.cwd() / "app_icon.ico",
+    ]
+    for c in candidates:
+        if c.is_file():
+            ico = QIcon(str(c))
+            if not ico.isNull():
+                return ico
+
     icon = QIcon()
     for size in (16, 24, 32, 48, 64, 128, 256):
         pm = QPixmap(size, size)
