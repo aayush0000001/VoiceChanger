@@ -12,6 +12,10 @@ venv/
 env/
 ENV/
 
+# Assistant & Agent Tooling Metadata
+.agents/
+.gemini/
+
 # Packaging / PyInstaller / Nuitka build artifacts
 build/
 dist/
@@ -20,11 +24,17 @@ dist/
 *.dist/
 *.onefile-build/
 
-# Local User Profiles & Voice Configs
+# Local User Profiles, Custom Presets & Application Logs
+custom_presets.json
+custom_presets.json.bad
 tactical_voice_profile.json
 *.profile.json
+*.log
+logs/
+*.bad
+*.tmp
 
-# AI Voice Weights & Checkpoints (keep repo lightweight)
+# AI Voice Weights & Heavy Checkpoints (keep repo lightweight)
 models/
 weights/
 *.onnx
@@ -34,11 +44,15 @@ weights/
 
 # IDE & OS metadata
 .idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Git worktrees for side branches (packaging builds, experiments)
 .worktrees/
 
 # Screenshots and UI test captures
 screenshots/
-custom_presets.json
-custom_presets.json.bad
