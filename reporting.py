@@ -15,7 +15,6 @@ import re
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Callable, Dict, Optional
 
 import report_config
@@ -108,15 +107,36 @@ def mailto_url(address: str, title: str, body: str, body_limit: int = report_con
     return url
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect: the report goes to the one host in the config and nowhere else."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+_NO_REDIRECT = None
 
 
-def _default_open(request: urllib.request.Request, timeout: float):
-    return urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout)
+def _no_redirect_class():
+    """
+    The handler that never follows a redirect (the report goes to the one host in the config and nowhere else). Built on
+    first use: urllib.request pulls in ssl and http, which a player who never sends a report does not need in memory.
+    """
+    global _NO_REDIRECT
+    if _NO_REDIRECT is None:
+        import urllib.request
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        _NO_REDIRECT = NoRedirect
+    return _NO_REDIRECT
+
+
+def __getattr__(name: str):  # keeps ``reporting._NoRedirect`` available (the unit tests use it)
+    if name == "_NoRedirect":
+        return _no_redirect_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _default_open(request, timeout: float):
+    import urllib.request
+
+    return urllib.request.build_opener(_no_redirect_class()).open(request, timeout=timeout)
 
 
 class ReportError(Exception):
@@ -139,6 +159,8 @@ def post_report(
     if reply_to.strip():
         fields["email"] = reply_to.strip()
         fields["_replyto"] = reply_to.strip()
+    import urllib.request
+
     request = urllib.request.Request(
         endpoint,
         data=urllib.parse.urlencode(fields).encode("utf-8"),

@@ -52,6 +52,7 @@ class LiveView(PageBase):
         self._active_preset = ""
         self._custom_names: List[str] = []
         self._reserved: List[str] = []
+        self._lite = False
 
         # header: status + the one big button
         self.statusPill = StatusPill()
@@ -138,6 +139,8 @@ class LiveView(PageBase):
                 p["key"], p["title"], p["tag"], p["hotkey"], p["blurb"], icon_by_name(p["icon"]), custom=p["custom"]
             )
             tile.chosen.connect(self.presetRequested)
+            if self._lite:
+                tile.backgroundColorAni.setDuration(0)
             if p["custom"]:
                 tile.renameRequested.connect(self._rename_preset)
                 tile.exportRequested.connect(self._export_preset)
@@ -145,6 +148,12 @@ class LiveView(PageBase):
             self._tiles[p["key"]] = tile
             self.tileGrid.add(tile)
         self.apply_preset(self._active_preset)
+
+    def set_lite(self, lite: bool) -> None:
+        """Lite mode: hover and selection colours switch at once instead of fading (every fade frame is Python painting)."""
+        self._lite = lite
+        for tile in self._tiles.values():
+            tile.backgroundColorAni.setDuration(0 if lite else 120)
 
     # ------------------------------------------------------------------ custom preset actions (dialogs live here)
     def _rename_preset(self, key: str) -> None:
@@ -223,7 +232,7 @@ class LiveView(PageBase):
             # numbers that change every block are unreadable at 30 Hz and repainting them is not free
             self._stats_at = now
             self.dspStat.set(f"{data['dsp_ms']:.2f} ms", f"slowest {data['peak_dsp_ms']:.2f} ms")
-            self.roundtripStat.set(f"~{data['roundtrip_ms']:.1f} ms", "two buffers + DSP + ~6 ms driver")
+            self.roundtripStat.set(f"~{data['roundtrip_ms']:.1f} ms", f"two buffers + DSP + {data['driver_ms']:.0f} ms driver")
             load = data["load"]
             self.loadStat.set(f"{load * 100:.0f}%", f"{data['xruns']} dropouts")
             self.loadBar.set_state(load, "danger" if load >= 0.85 else ("warn" if load >= 0.6 else "ok"))

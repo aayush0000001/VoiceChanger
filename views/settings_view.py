@@ -55,6 +55,31 @@ class SettingsView(PageBase):
         )
         self.content.addWidget(self.appearanceCard)
 
+        # ---- performance -----------------------------------------------------------------------------
+        self.add_section("Performance")
+        self.performanceCard = GroupCard("For older or busy PCs")
+        self.liteSwitch = SwitchButton()
+        self.liteSwitch.setOnText("On")
+        self.liteSwitch.setOffText("Off")
+        self.liteSwitch.checkedChanged.connect(lambda checked: self.flagToggled.emit("lite_mode", checked))
+        self.stabilitySwitch = SwitchButton()
+        self.stabilitySwitch.setOnText("On")
+        self.stabilitySwitch.setOffText("Off")
+        self.stabilitySwitch.checkedChanged.connect(lambda checked: self.flagToggled.emit("stability_buffer", checked))
+        self.performanceCard.add_row(
+            FluentIcon.SPEED_OFF,
+            "Lite mode",
+            "Uses less memory and CPU: slower meters, no fades or Mica, memory handed back while the window is hidden.",
+            self.liteSwitch,
+        )
+        self.stabilityRow = self.performanceCard.add_row(
+            FluentIcon.SPEED_HIGH,
+            "Stability buffer",
+            "Rides out longer stalls without a hole in your voice, for roughly 40 ms more delay. Applies at the next start.",
+            self.stabilitySwitch,
+        )
+        self.content.addWidget(self.performanceCard)
+
         # ---- hotkeys ---------------------------------------------------------------------------------
         self.add_section("Global hotkeys")
         self.hotkeyCard = GroupCard("Work in fullscreen VALORANT, no keyboard hook")
@@ -191,7 +216,7 @@ class SettingsView(PageBase):
             self.onnxModelSelected.emit(path)
 
     # ------------------------------------------------------------------ slots (window / bridge -> view)
-    def apply_appearance(self, theme_key: str, mica_supported: bool, mica_enabled: bool) -> None:
+    def apply_appearance(self, theme_key: str, mica_supported: bool, mica_enabled: bool, lite: bool = False) -> None:
         self._applying = True
         try:
             index = next((i for i, (_, key) in enumerate(THEMES) if key == theme_key), 0)
@@ -199,10 +224,14 @@ class SettingsView(PageBase):
         finally:
             self._applying = False
         set_switch(self.micaSwitch, mica_enabled and mica_supported)
-        self.micaSwitch.setEnabled(mica_supported)
-        self.micaRow.contentLabel.setText(
-            "Windows 11 material behind the window." if mica_supported else "Needs Windows 11. Using a solid background."
-        )
+        self.micaSwitch.setEnabled(mica_supported and not lite)
+        if not mica_supported:
+            note = "Needs Windows 11. Using a solid background."
+        elif lite:
+            note = "Off while Lite mode is on."
+        else:
+            note = "Windows 11 material behind the window."
+        self.micaRow.contentLabel.setText(note)
 
     def set_catalog(self, data: dict) -> None:
         self._profile_file = data["profile_file"]
@@ -240,7 +269,12 @@ class SettingsView(PageBase):
             )
 
     def apply_flags(self, flags: dict) -> None:
-        self.update_when_shown("flags", lambda: set_switch(self.onnxSwitch, bool(flags["enable_onnx"])))
+        def apply() -> None:
+            set_switch(self.onnxSwitch, bool(flags["enable_onnx"]))
+            set_switch(self.liteSwitch, bool(flags.get("lite_mode")))
+            set_switch(self.stabilitySwitch, bool(flags.get("stability_buffer")))
+
+        self.update_when_shown("flags", apply)
 
     def apply_onnx(self, data: dict) -> None:
         path = data["path"]

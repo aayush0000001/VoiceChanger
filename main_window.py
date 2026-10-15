@@ -5,6 +5,8 @@ the wiring between the pages and the EngineBridge. All engine traffic goes throu
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import sys
 import time
 from pathlib import Path
@@ -39,6 +41,20 @@ MICA_MIN_BUILD = 22000  # Windows 11
 
 def mica_supported() -> bool:
     return sys.platform == "win32" and sys.getwindowsversion().build >= MICA_MIN_BUILD
+
+
+def trim_working_set() -> None:
+    """Hands the memory this process is not touching back to Windows (its pages stay in the standby list and come back
+    on demand). Used by Lite mode while the window is hidden, so the audio engine and hotkeys cost the least RAM."""
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        ctypes.windll.psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+        ctypes.windll.psapi.EmptyWorkingSet(kernel32.GetCurrentProcess())
+    except Exception:
+        pass
 
 
 def make_app_icon() -> QIcon:
@@ -86,6 +102,10 @@ class MainWindow(FluentWindow):
     reportSubmitRequested = pyqtSignal(object)  # {"title", "body", "reply_to"} from the report form
     errorOccurred = pyqtSignal(str)             # raised by the exception hooks, which can fire on any thread
 
+    # Qt sends change events while the base class is still being constructed, before __init__ gets to set these
+    _lite = False
+    _trim_timer = None
+
     def __init__(self) -> None:
         settings = QSettings(APP_NAME, APP_NAME)
         saved_theme = str(settings.value("appearance/theme", "auto"))
@@ -105,6 +125,11 @@ class MainWindow(FluentWindow):
         self._theme_key = saved_theme
         self._mica_pref = settings.value("appearance/mica", True, type=bool)
         self._last_error_toast = 0.0
+        self._lite = False   # Lite mode: set by apply_flags once the bridge reports the saved setting
+        self._trim_timer = QTimer(self)
+        self._trim_timer.setSingleShot(True)
+        self._trim_timer.setInterval(3000)
+        self._trim_timer.timeout.connect(self._trim_memory)
 
         self.bridge = EngineBridge()
         self.themeListener = SystemThemeListener(self)
@@ -198,6 +223,7 @@ class MainWindow(FluentWindow):
         b.flags_changed.connect(lv.apply_flags)
         b.flags_changed.connect(dv.apply_flags)
         b.flags_changed.connect(sv.apply_flags)
+        b.flags_changed.connect(self.apply_flags)
         b.devices_changed.connect(dv.apply_devices)
         b.engine_state_changed.connect(lv.apply_engine_state)
         b.engine_state_changed.connect(dv.apply_engine_state)
@@ -234,9 +260,13 @@ class MainWindow(FluentWindow):
         self.tray.show()
 
     def _init_backdrop(self) -> None:
+        self._apply_backdrop()
+
+    def _apply_backdrop(self) -> None:
+        """Mica when the player wants it and the PC has it; a solid theme background otherwise, and in Lite mode."""
         supported = mica_supported()
-        self.setMicaEffectEnabled(supported and self._mica_pref)  # solid theme background where Mica is unavailable
-        self.settingsView.apply_appearance(self._theme_key, supported, self._mica_pref)
+        self.setMicaEffectEnabled(supported and self._mica_pref and not self._lite)
+        self.settingsView.apply_appearance(self._theme_key, supported, self._mica_pref, self._lite)
 
     # ------------------------------------------------------------------ appearance
     def set_theme(self, key: str) -> None:
@@ -250,13 +280,13 @@ class MainWindow(FluentWindow):
         self._mica_pref = enabled
         self.settings.setValue("appearance/mica", enabled)
         if mica_supported():
-            self.setMicaEffectEnabled(enabled)
+            self.setMicaEffectEnabled(enabled and not self._lite)
 
     def reset_appearance(self, *_args) -> None:
         """Part of 'Reset all settings': follow Windows' theme again and bring Mica back."""
         self.set_theme("auto")
         self.set_mica(True)
-        self.settingsView.apply_appearance("auto", mica_supported(), True)
+        self.settingsView.apply_appearance("auto", mica_supported(), True, self._lite)
 
     def _on_system_theme_changed(self) -> None:
         setTheme(Theme.AUTO)
@@ -271,7 +301,24 @@ class MainWindow(FluentWindow):
     def _apply_animation_policy(self) -> None:
         """Page transitions repaint a whole page for 300 ms, enough to delay a live audio block (measured), so they
         only play while the audio engine is stopped."""
-        self.stackedWidget.setAnimationEnabled(not self._engine_live)
+        self.stackedWidget.setAnimationEnabled(not (self._engine_live or self._lite))
+
+    def apply_flags(self, flags: dict) -> None:
+        """Lite mode is a window-level matter too: no Mica, no fades, and memory handed back while hidden."""
+        lite = bool(flags.get("lite_mode"))
+        if lite == self._lite:
+            return
+        self._lite = lite
+        self._apply_backdrop()
+        self._apply_animation_policy()
+        self.liveView.set_lite(lite)
+        self._sync_telemetry()   # starts the memory trim when the window is already hidden
+
+    def _trim_memory(self) -> None:
+        if self._lite and not (self.isVisible() and not self.isMinimized()):
+            if not self._engine_live:
+                gc.collect()  # a full collection holds the GIL for tens of ms, which a running audio callback would feel
+            trim_working_set()
 
     def apply_engine_state(self, data: dict) -> None:
         running = data["state"] == "running"
@@ -382,8 +429,12 @@ class MainWindow(FluentWindow):
         costs the audio engine nothing (hotkeys and audio keep running regardless)."""
         window_shown = self.isVisible() and not self.isMinimized()
         if window_shown:  # state changes that arrived while nobody could see them (hotkeys in a match)
+            if self._trim_timer is not None:
+                self._trim_timer.stop()
             for page in (self.liveView, self.voiceView, self.devicesView, self.settingsView):
                 page.flush_deferred()
+        elif self._lite and self._trim_timer is not None:
+            self._trim_timer.start()  # a few seconds after the window went away, give the memory back
         self.telemetryActive.emit(window_shown and self.stackedWidget.currentWidget() is self.liveView)
 
     def resizeEvent(self, e) -> None:

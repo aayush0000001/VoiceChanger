@@ -32,11 +32,12 @@ import presets as pr
 import reporting
 
 TELEMETRY_INTERVAL_MS = 33      # ~30 Hz meters and latency readout
+LITE_TELEMETRY_INTERVAL_MS = 100  # Lite mode: 10 Hz is plenty for the numbers and bars, and a third of the painting
 PARAM_FLUSH_INTERVAL_MS = 25    # slider drags are coalesced to at most ~40 snapshot rebuilds per second
 
 BLOCK_SIZES = (128, 256, 512)
 DEVICE_ROLES = ("input", "output", "monitor")
-FLAG_NAMES = ("bypass_effects", "mic_muted", "hear_myself", "enable_onnx")
+FLAG_NAMES = ("bypass_effects", "mic_muted", "hear_myself", "enable_onnx", "lite_mode", "stability_buffer")
 PARAM_NAMES = tuple(f for f in eng.VoiceParameters.__dataclass_fields__ if f != "name")
 
 # What the UI shows for each preset: (one-line description, Fluent icon name). The DSP numbers live in
@@ -155,6 +156,7 @@ class EngineBridge(QObject):
         self._telemetry_timer = QTimer(self)
         self._telemetry_timer.setInterval(TELEMETRY_INTERVAL_MS)
         self._telemetry_timer.timeout.connect(self._tick)
+        self._apply_lite()
 
         if self._profile_autoloaded:
             self.engine.dsp.update_parameters(cfg.current_params)
@@ -286,7 +288,16 @@ class EngineBridge(QObject):
             "hear_myself": cfg.hear_myself,
             "enable_onnx": cfg.enable_onnx,
             "monitor_volume": cfg.monitor_volume,
+            "lite_mode": cfg.lite_mode,
+            "stability_buffer": cfg.stability_buffer,
         }
+
+    def _apply_lite(self) -> None:
+        """Lite mode slows the meters down; the window handles the rest (Mica, fades, memory) when it hears about it."""
+        if self._telemetry_timer is not None:
+            self._telemetry_timer.setInterval(
+                LITE_TELEMETRY_INTERVAL_MS if self.config.lite_mode else TELEMETRY_INTERVAL_MS
+            )
 
     def _params_payload(self) -> dict:
         d = asdict(self.config.current_params)
@@ -319,6 +330,7 @@ class EngineBridge(QObject):
             "block_size": block,
             "sample_rate": cfg.sample_rate,
             "block_ms": block / cfg.sample_rate * 1000.0,
+            "driver_latency_ms": list(self.engine.stream_latency_ms) if running else [0.0, 0.0],
         }
 
     def _onnx_payload(self, message: str = "") -> dict:
@@ -452,6 +464,8 @@ class EngineBridge(QObject):
         block_size = self._block_size()
         block_ms = block_size / cfg.sample_rate * 1000.0
         peak = t["peak_dsp_ms"] or t["dsp_ms"]
+        driver_ms = sum(self.engine.stream_latency_ms) if self.engine.is_running else 0.0
+        driver_ms = driver_ms if driver_ms > 0.0 else 6.0  # until the driver reports its buffering, assume a typical 6 ms
         self.status_updated.emit(
             {
                 "running": self.engine.is_running,
@@ -462,7 +476,8 @@ class EngineBridge(QObject):
                 "block_ms": block_ms,
                 "block_size": block_size,
                 "load": peak / block_ms if block_ms else 0.0,
-                "roundtrip_ms": block_ms * 2.0 + t["dsp_ms"] + 6.0,
+                "roundtrip_ms": block_ms * 2.0 + t["dsp_ms"] + driver_ms,
+                "driver_ms": driver_ms,
                 "xruns": int(t["xruns"]),
                 "tag": "MUTED" if cfg.mic_muted else ("BYPASS" if cfg.bypass_effects else cfg.active_preset),
             }
@@ -515,9 +530,13 @@ class EngineBridge(QObject):
         if name not in FLAG_NAMES:
             return
         setattr(self.config, name, bool(value))
+        if name == "lite_mode":
+            self._apply_lite()
         self.flags_changed.emit(self._flags_payload())
         if name == "hear_myself" and value:
             self._check_monitor()
+        elif name == "stability_buffer" and self.engine.is_running:
+            self._notify("info", "Applies at the next start", "Restart the audio engine to use the new buffer.")
 
     def _check_monitor(self) -> None:
         """Hear Myself plays through a second stream, which only opens on a device other than the cable output."""
@@ -671,6 +690,7 @@ class EngineBridge(QObject):
             except OSError as exc:
                 problems.append(f"{pr.LIBRARY_FILENAME} could not be updated ({exc.strerror or exc})")
         self._scan_devices(refresh=not running)
+        self._apply_lite()
         if self._profile_path.is_file():                # the file that is loaded on every start
             try:
                 eng.save_profile(cfg, self._profile_path)
@@ -785,6 +805,7 @@ class EngineBridge(QObject):
             return
         self._pending.clear()
         self._scan_devices()
+        self._apply_lite()
         self.engine.dsp.update_parameters(self.config.current_params)
         self._publish_everything()
         self.profile_changed.emit({"path": str(Path(path).resolve()), "autoloaded": False})
@@ -811,6 +832,8 @@ class EngineBridge(QObject):
             "block_size": self._block_size(),
             "preset": cfg.active_preset,
             "flags": self._flags_payload(),
+            "lite_mode": cfg.lite_mode,
+            "stability_buffer": cfg.stability_buffer,
             "engine": self.engine.read_session_stats() if self.engine else {},
             "qt_versions": qt_versions,
         }

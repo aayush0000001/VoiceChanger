@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import importlib.util
 import json
 import os
 import sys
@@ -38,12 +39,21 @@ except ImportError:
     sd = None
     SOUNDDEVICE_AVAILABLE = False
 
-try:
-    import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
-    ort = None
-    ONNX_AVAILABLE = False
+STABILITY_LATENCY_S = 0.06  # suggested stream latency, in seconds, while the Stability buffer is on
+
+# onnxruntime is only needed once an AI model is loaded, and importing it costs tens of megabytes, so it is looked for
+# here but imported on first use (see _load_onnxruntime).
+ONNX_AVAILABLE = importlib.util.find_spec("onnxruntime") is not None
+ort = None
+
+
+def _load_onnxruntime():
+    global ort
+    if ort is None:
+        import onnxruntime  # noqa: PLC0415
+
+        ort = onnxruntime
+    return ort
 
 
 # ============================================================================
@@ -154,6 +164,8 @@ class AppConfig:
     active_preset: str = "Deep Shadow (Omen)"
     onnx_model_path: str = ""
     enable_onnx: bool = False
+    lite_mode: bool = False          # for older PCs: slower meters, no fades or Mica, memory trimmed while hidden
+    stability_buffer: bool = False   # asks Windows for a bigger audio buffer: fewer dropouts, a little more delay
     current_params: VoiceParameters = field(
         default_factory=lambda: VoiceParameters(**asdict(TACTICAL_PRESETS["Deep Shadow (Omen)"]))
     )
@@ -499,12 +511,13 @@ class ONNXVoiceStreamer:
         if not os.path.isfile(model_path):
             return False, "Model file not found."
         try:
+            rt = _load_onnxruntime()
             providers = ["DmlExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
-            available = [p for p in providers if p in ort.get_available_providers()]
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            available = [p for p in providers if p in rt.get_available_providers()]
+            sess_opts = rt.SessionOptions()
+            sess_opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
             sess_opts.intra_op_num_threads = 2
-            self.session = ort.InferenceSession(model_path, sess_options=sess_opts, providers=available)
+            self.session = rt.InferenceSession(model_path, sess_options=sess_opts, providers=available)
             self.input_name = self.session.get_inputs()[0].name
             self.active = True
             return True, f"Loaded on {self.session.get_providers()[0]}"
@@ -781,6 +794,7 @@ class AudioEngineManager:
         self._dsp_blocks: int = 0
         self._dsp_total_ms: float = 0.0
         self._dsp_worst_ms: float = 0.0
+        self.stream_latency_ms: Tuple[float, float] = (0.0, 0.0)  # driver buffering reported by PortAudio when it started
 
     def _set_status(self, text: str) -> None:
         self.status_text = text
@@ -929,6 +943,9 @@ class AudioEngineManager:
                 except Exception:
                     extra_cfg = None
 
+            # A numeric suggested latency really enlarges WASAPI's shared-mode buffer; "high" does not (it gives the
+            # same buffer as "low"): more headroom against a busy PC for a few tens of ms more delay.
+            latency = STABILITY_LATENCY_S if self.config.stability_buffer else "low"
             self.xruns = 0
             self.peak_dsp_ms = 0.0
             self._dsp_blocks = 0
@@ -940,11 +957,16 @@ class AudioEngineManager:
                 device=(in_idx, out_idx),
                 channels=(in_ch, out_ch),
                 dtype="float32",
-                latency="low",
+                latency=latency,
                 extra_settings=extra_cfg,
                 callback=self._primary_callback,
             )
             self.primary_stream.start()
+            try:  # what the driver really gave us, in milliseconds (input, output)
+                lat = self.primary_stream.latency
+                self.stream_latency_ms = (float(lat[0]) * 1000.0, float(lat[1]) * 1000.0)
+            except Exception:
+                self.stream_latency_ms = (0.0, 0.0)
 
             if mon_idx is not None and mon_idx != out_idx:
                 mon_info = sd.query_devices(mon_idx)
@@ -955,7 +977,7 @@ class AudioEngineManager:
                     device=mon_idx,
                     channels=mon_ch,
                     dtype="float32",
-                    latency="low",
+                    latency=latency,
                     extra_settings=extra_cfg,
                     callback=self._monitor_callback,
                 )
