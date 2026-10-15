@@ -1186,7 +1186,7 @@ class Win32HotkeyListener(threading.Thread):
     Windows ties a registration to the thread that made it, so every RegisterHotKey / UnregisterHotKey call is made on
     this thread. Other threads change the bindings with ``apply`` / ``suspend`` / ``resume``: each queues a command and
     wakes the pump without waiting, and the outcome comes back through ``on_result(dict)``, also called on this thread
-    (emit a Qt signal from it): ``{"token", "kind", "suspended", "table", "registered", "errors", "reverted"}``.
+    (emit a Qt signal from it): ``{"token", "kind", "suspended", "table", "registered", "errors", "reverted", "error"}``.
     A change Windows refuses (another program owns the combination) is put back to the previous combination, and its
     id is listed in ``reverted``. ``registered`` maps each bound hotkey id to whether Windows accepts it right now.
     """
@@ -1219,6 +1219,7 @@ class Win32HotkeyListener(threading.Thread):
         self.running = True
         self.registered: Dict[int, bool] = {}
         self.errors: Dict[int, int] = {}                 # last Win32 error per hotkey id that Windows refused
+        self.last_error = ""                             # an unexpected exception while running a command (the pump survives it)
         self.ready = threading.Event()                   # set once the first registrations have been attempted
         self._wanted: Dict[int, Optional[Tuple[int, int]]] = dict(
             bindings if bindings is not None else self.default_table()
@@ -1318,6 +1319,7 @@ class Win32HotkeyListener(threading.Thread):
                     "registered": dict(self.registered),
                     "errors": dict(refused),
                     "reverted": list(reverted),
+                    "error": self.last_error,
                 }
             )
         except Exception:
@@ -1330,14 +1332,19 @@ class Win32HotkeyListener(threading.Thread):
             except queue.Empty:
                 return
             kind, token = command[0], command[1]
-            if kind == "apply":
-                refused, reverted = self._apply(command[2], command[3])
-            elif kind == "suspend":
-                self._suspended = True
-                refused, reverted = self._sync(), []
-            else:  # resume
-                self._suspended = False
-                refused, reverted = self._sync(), []
+            self.last_error = ""
+            try:
+                if kind == "apply":
+                    refused, reverted = self._apply(command[2], command[3])
+                elif kind == "suspend":
+                    self._suspended = True
+                    refused, reverted = self._sync(), []
+                else:  # resume
+                    self._suspended = False
+                    refused, reverted = self._sync(), []
+            except Exception as exc:  # a bug here must not end the message pump: the hotkeys would just stop working
+                refused, reverted = {}, []
+                self.last_error = f"{type(exc).__name__}: {exc}"
             self._publish(token, kind, refused, reverted)
 
     def run(self) -> None:

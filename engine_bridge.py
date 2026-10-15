@@ -128,6 +128,7 @@ class EngineBridge(QObject):
         self._hk_conflicts: Dict[str, str] = {}               # action id -> why the last change was refused
         self._hk_pending: Dict[int, dict] = {}                # command token -> what to do with the answer
         self._hk_tokens = itertools.count(1)
+        self._hk_file_unreadable = False                      # hotkeys.json exists but is not a hotkeys file
         self._hk_suspended = False                            # a hotkey is being picked: nothing is registered
         self._hk_baseline: Dict[str, str] = hk.default_bindings()  # what is on disk (or was loaded at start)
         self._hk_watchdog: Optional[QTimer] = None
@@ -163,6 +164,7 @@ class EngineBridge(QObject):
         cfg = self.config
         self._profile_autoloaded = self._profile_path.is_file() and eng.load_profile_into(cfg, self._profile_path)
         saved = hk.load_store()
+        self._hk_file_unreadable = saved is None and hk.store_path().exists()
         if saved is not None:
             cfg.hotkeys = saved  # the player's last choice in Settings wins over the hotkeys inside the startup profile
         self._hk_baseline = dict(cfg.hotkeys)
@@ -201,6 +203,13 @@ class EngineBridge(QObject):
         self.ready.emit()
         if self._library.load_error:
             self._set_damaged_library_aside()
+        if self._hk_file_unreadable:
+            applog.get_logger().warning("%s could not be read; the hotkeys come from the profile or the defaults", hk.store_path())
+            self._notify(
+                "warning",
+                "Your saved hotkeys could not be read",
+                f"{hk.store_path().name} is damaged, so the hotkeys from the profile or the defaults are used. Changing a hotkey saves a new file.",
+            )
 
     @pyqtSlot()
     def _shutdown(self) -> None:
@@ -874,6 +883,9 @@ class EngineBridge(QObject):
         (another program owns the combination) has been put back on the previous combination there."""
         context = self._hk_pending.pop(result.get("token"), None) or {}
         kind = result["kind"]
+        if result.get("error"):
+            applog.get_logger().error("Hotkey listener: %s", result["error"])
+            self._notify("error", "Hotkeys hit a problem", f"{result['error']}. Settings > Report a problem sends it to the developer.")
         if kind == "suspend":
             if "capture" in context and self._hk_suspended:
                 self.hotkey_capture_ready.emit(context["capture"])
