@@ -20,10 +20,19 @@ import winintegration as wi
 QUIT_ARG = "--quit"
 
 
-def _send(command: str) -> bool:
-    from winapp_ui import send_command  # PyQt6.QtCore + QtNetwork only; numpy and the engine stay unloaded
+def _send(command: str, timeout_ms: int = 1500) -> bool:
+    """Sends 'show' or 'quit' to the running copy. True when it answered. Loads only QtCore and QtNetwork."""
+    from PyQt6.QtNetwork import QLocalSocket
 
-    return send_command(command)
+    sock = QLocalSocket()
+    sock.connectToServer(wi.server_name())
+    if not sock.waitForConnected(timeout_ms):
+        return False
+    sock.write(command.encode("ascii") + b"\n")
+    sock.waitForBytesWritten(timeout_ms)
+    answered = sock.waitForReadyRead(timeout_ms) and bytes(sock.readAll()).startswith(b"ok")
+    sock.disconnectFromServer()
+    return answered
 
 
 def _quit_running(timeout_s: float = 15.0) -> int:

@@ -22,19 +22,6 @@ from views.widgets import muted, set_switch
 SETUP_DONE_KEY = "setup/completed"
 
 
-def send_command(command: str, timeout_ms: int = 1500) -> bool:
-    """Sends 'show' or 'quit' to the running copy. True when it answered."""
-    sock = QLocalSocket()
-    sock.connectToServer(wi.server_name())
-    if not sock.waitForConnected(timeout_ms):
-        return False
-    sock.write(command.encode("ascii") + b"\n")
-    sock.waitForBytesWritten(timeout_ms)
-    answered = sock.waitForReadyRead(timeout_ms) and bytes(sock.readAll()).startswith(b"ok")
-    sock.disconnectFromServer()
-    return answered
-
-
 class InstanceServer(QObject):
     def __init__(self, window) -> None:
         super().__init__(window)
@@ -76,7 +63,6 @@ def bring_to_front(window) -> None:
 
 def _add_settings_rows(window) -> None:
     sv = window.settingsView
-    sv._profile_file = str(appdata.profile_path())  # Save JSON Profile starts on the profile that loads at startup
 
     autostart = SwitchButton()
     autostart.setOnText("On")
@@ -101,8 +87,8 @@ def _add_settings_rows(window) -> None:
     folder.clicked.connect(lambda: appdata.open_folder(appdata.roaming_dir()))
     sv.appCard.add_row(
         FluentIcon.FOLDER,
-        "Your data",
-        f"Settings, profile and custom presets are in {appdata.roaming_dir()}. The log is in {appdata.local_dir(create=False)}.",
+        "Open data folder",
+        "Settings, voice profile and custom presets. Uninstalling asks before it deletes them."
         folder,
     )
 
@@ -148,6 +134,9 @@ class _FirstRunTrigger(QObject):
         self._shown = False
         self._done = False
         window.bridge.ready.connect(self._on_ready)
+        # the bridge thread may already be done (its ready signal went out before we connected); the device boxes
+        # still fill from its queued signals once the event loop runs
+        self._ready = window.bridge.engine is not None
         window.installEventFilter(self)
 
     def _on_ready(self) -> None:

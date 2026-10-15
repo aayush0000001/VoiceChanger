@@ -331,7 +331,7 @@ class EngineBridge(QObject):
                 {"samples": b, "ms": b / self.config.sample_rate * 1000.0} for b in BLOCK_SIZES
             ],
             "onnx_available": eng.ONNX_AVAILABLE,
-            "profile_file": eng.PROFILE_FILENAME,
+            "profile_file": str(self._profile_path),
             "preset_file": pr.LIBRARY_FILENAME,
             "sample_rate": self.config.sample_rate,
             # what the naming dialogs need to validate a name as the player types it
