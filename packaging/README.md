@@ -1,53 +1,34 @@
 # Building the V-COMMS installer
 
-This folder turns `val_voice_changer.py` into a normal Windows app, so people
-can install it without Python or `pip install -r requirements.txt`.
-
-## One-step build
-
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging\build.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 ```
 
 This:
 
-1. creates `.venv-build` (separate from your dev `.venv`) with x64 Python and
-   installs `requirements.txt` plus PyInstaller,
-2. builds the app folder `dist\V-COMMS\` (`V-COMMS.exe` + `_internal\`),
-3. builds `dist\installer\V-COMMS-Setup-<version>.exe` with Inno Setup 6
-   (`winget install JRSoftware.InnoSetup` if you don't have it).
+1. creates `.venv-build` (separate from your dev `.venv`) with x64 Python and installs `requirements.txt` plus
+   PyInstaller,
+2. builds the app folder `dist\V-COMMS\` (`V-COMMS.exe` + `_internal\`) from `vcomms.spec`; the entry point is
+   `vcomms_main.py` and the version comes from `APP_VERSION` in `appinfo.py`,
+3. downloads VB-Audio's VB-CABLE driver pack into `build\vbcable`, checks it against the pinned SHA-256 and checks that
+   its setup programs are signed by VB-Audio,
+4. builds `dist\installer\V-COMMS-Setup-<version>.exe` with Inno Setup 6 (`winget install JRSoftware.InnoSetup`).
 
-Use `-SkipInstaller` to stop after step 2, or `-Python <path>` to pick the
-interpreter used for the build venv.
+To release a new version, change `APP_VERSION` in `appinfo.py`. When VB-Audio publishes a new driver pack, update
+`$VBCableUrl` and `$VBCableSha256` in `build.ps1`.
 
 ## What the installer does
 
-- Installs per user to `%LOCALAPPDATA%\Programs\V-COMMS`. No admin prompt, and
-  the folder stays writable for `tactical_voice_profile.json`.
-- Adds Start Menu shortcuts (app, VB-CABLE download page, uninstall) and an
-  optional desktop shortcut.
-- Shows up in Settings > Apps for uninstalling. Saved profiles are kept.
-- Offers to open the official VB-CABLE download page on the last screen.
+- Installs per user into `%LOCALAPPDATA%\Programs\V-COMMS`, so neither the app nor its upgrades need admin.
+- Installs VB-CABLE silently only when CABLE Input or CABLE Output is missing. That is the only UAC prompt. It asks
+  for a restart only if the devices don't appear without one.
+- Closes a running V-COMMS before an upgrade (`V-COMMS.exe --quit`), including an old portable v1.0.2, after asking.
+- Start Menu shortcut, optional desktop shortcut, optional Start with Windows (off by default).
+- Uninstall keeps the player's data in `%APPDATA%\V-COMMS` and VB-CABLE unless they tick a box. A silent uninstall
+  keeps the data unless `/REMOVEUSERDATA` is passed.
 
-## VB-CABLE
+VB-CABLE is bundled as VB-Audio's licensing page allows for donationware use: the installer names VB-Audio,
+links to the donation page and shows the credit. The Windows build ships the GPLv3 text (`LICENSE-GPL-3.0.txt`)
+because it bundles PyQt6 and PyQt6-Fluent-Widgets.
 
-V-COMMS needs the VB-CABLE driver, which is not bundled. VB-Audio does allow
-bundling VB-CABLE (not the A+B / C+D variants) in other installers, as long as
-it is credited as donationware from vb-cable.com
-(<https://vb-audio.com/Services/licensing.htm>). It is left out because the
-driver install needs admin rights and a reboot, which doesn't fit a per-user
-installer.
-
-## Qt binding
-
-`vcomms.spec` reads `val_voice_changer.py` to see whether it imports PySide6
-or PyQt6 (plus `qfluentwidgets`) and bundles only that binding, so the same
-build works before and after the Fluent redesign.
-
-## Notes
-
-- The build is x64. It also runs on Windows on Arm through emulation.
-- The exe is windowed, so `--self-test` output isn't visible from it. Run the
-  self-test from source instead.
-- The exe isn't code-signed, so SmartScreen will show "Windows protected your
-  PC" on first run (More info > Run anyway) until it is signed.
+The installer and exe are not code-signed yet, so SmartScreen warns on first download.

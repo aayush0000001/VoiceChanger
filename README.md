@@ -1,8 +1,8 @@
 # V-COMMS // Real-Time Low-Latency Tactical Voice Engine (Windows 11)
 
-[![Download Executable](https://img.shields.io/badge/Download-Standalone%20EXE-2ea44f?style=for-the-badge&logo=windows)](https://github.com/aayush0000001/VoiceChanger/releases/latest)
+[![Download Installer](https://img.shields.io/badge/Download-Windows%20Installer-2ea44f?style=for-the-badge&logo=windows)](https://github.com/aayush0000001/VoiceChanger/releases/latest)
 ![Platform Windows 11](https://img.shields.io/badge/Platform-Windows%2011%20(WASAPI)-0078D6?logo=windows)
-![Latency ~19ms](https://img.shields.io/badge/Est.%20Roundtrip%20Latency-~19ms-00F5D4)
+![Latency ~115ms](https://img.shields.io/badge/Measured%20End--to--End%20Latency-~115ms-00F5D4)
 ![Vanguard Safe](https://img.shields.io/badge/Riot%20Vanguard-100%25%20Compliant-FF4655)
 
 **V-COMMS** is a lightweight, wait-free real-time DSP voice conversion desktop application engineered for tactical gaming voice chat (**VALORANT**, **Discord**, **OBS Studio**) on Windows 11.
@@ -13,12 +13,13 @@
 
 If you just want to use the voice changer without installing Python or programming dependencies:
 
-1. **Download the Executable:**
-   👉 Go to **[Latest Releases](https://github.com/aayush0000001/VoiceChanger/releases/latest)** and download **`V-COMMS.exe`**.
-2. **Install VB-CABLE:**
-   Download and install the free [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) (reboot if prompted).
-3. **Run the App:**
-   Double-click **`V-COMMS.exe`** to start.
+1. **Download the Installer:**
+   👉 Go to **[Latest Releases](https://github.com/aayush0000001/VoiceChanger/releases/latest)** and download **`V-COMMS-Setup-<version>.exe`**.
+2. **Run it:**
+   If your PC doesn't have the free [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) yet, Setup installs it (Windows asks for permission once). No admin rights are needed otherwise.
+3. **Start V-COMMS** from the Start Menu. The first-run setup checks your microphone and the cable and runs a test.
+
+Settings, your voice profile and custom presets live in `%APPDATA%\V-COMMS` (Settings > Open data folder). Upgrading from v1.0.2 copies your profile and presets in automatically.
 
 ---
 
@@ -65,18 +66,9 @@ python val_voice_changer.py
 
 ---
 
-## Mandatory Windows 11 + VB-Cable 48kHz Setup (Prevents Hidden OS Latency)
+## Sample Rates
 
-To prevent the Windows 11 Audio Graph from activating its internal sample-rate converter (which adds 15–25 ms of buffer lag), match your sample rates to **48000 Hz**:
-
-1. Install **VB-CABLE** (run installer as Administrator and reboot).
-2. Press `Win + R`, type `mmsys.cpl`, and press **Enter**.
-3. Under the **Playback** tab:
-   * Double-click **CABLE Input (VB-Audio Virtual Cable)** -> **Advanced** tab.
-   * Set Default Format to **24-bit, 48000 Hz (Studio Quality)** -> Click **Apply**.
-4. Under the **Recording** tab:
-   * Double-click **CABLE Output (VB-Audio Virtual Cable)** -> **Advanced** tab -> Set to **48000 Hz**.
-   * Double-click your **Physical Microphone** -> **Advanced** tab -> Set to **48000 Hz**.
+No Windows sound settings are needed. V-COMMS opens its streams with WASAPI's automatic format conversion, so your mic and VB-CABLE can run at any rate; measured on a 48 kHz cable, converting adds no delay.
 
 ---
 
@@ -126,17 +118,16 @@ These are the defaults. Change any of them in **Settings > Global hotkeys**: pre
 
 ---
 
-## Compiling Standalone `.exe` Locally
+## Building the Installer Locally
 
-To package V-COMMS manually using **PyInstaller** with the custom application icon:
+To build the app folder and the installer (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
 
 ```powershell
-pip install pyinstaller
-pyinstaller --noconsole --onefile --name "V-COMMS" --icon app_icon.ico --collect-all qfluentwidgets val_voice_changer.py
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 ```
-The compiled executable will be generated in `dist\V-COMMS.exe`.
+The installer is generated in `dist\installer\V-COMMS-Setup-<version>.exe`. See `packaging\README.md`.
 
 ---
 
 ## License
-MIT License
+MIT License. The Windows installer and exe are distributed under the GPLv3 because they bundle PyQt6 and PyQt6-Fluent-Widgets.

@@ -75,6 +75,7 @@ Name: "startup"; Description: "Start V-COMMS in the tray when I sign in to Windo
 
 [Files]
 Source: "..\dist\V-COMMS\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "LICENSE-GPL-3.0.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; VB-CABLE by VB-Audio (donationware, bundled as their licensing page allows); unpacked only when it is needed
 Source: "{#VBCableDir}\*"; DestDir: "{tmp}\vbcable"; Flags: ignoreversion recursesubdirs; Check: CableWanted
 

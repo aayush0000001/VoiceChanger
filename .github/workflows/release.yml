@@ -1,4 +1,4 @@
-name: Build and Release Standalone Executable
+name: Build and Release Windows Installer
 
 on:
   push:
@@ -20,33 +20,39 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: '3.13'
+          architecture: 'x64'
 
-      - name: Install dependencies
+      - name: Build the app and the installer
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          # build.ps1 takes the version from appinfo.py, downloads VB-CABLE and checks its hash and signature,
+          # then runs PyInstaller and Inno Setup (preinstalled on GitHub's Windows images)
+          ./packaging/build.ps1 -Python (Get-Command python).Source
 
-      - name: Build standalone executable with PyInstaller
-        run: |
-          pyinstaller --noconsole --onefile --name "V-COMMS" --icon app_icon.ico --add-data "app_icon.ico;." --collect-all qfluentwidgets val_voice_changer.py
-
-      - name: Create Release and Upload Executable
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      - name: Keep the installer as a build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: V-COMMS ${{ github.ref_name }} - Standalone Windows Executable
+          name: V-COMMS-installer
+          path: dist/installer/V-COMMS-Setup-*.exe
+
+      - name: Create Release and Upload Installer
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: V-COMMS ${{ github.ref_name }}
           draft: false
           prerelease: false
-          tag_name: ${{ github.ref_name || 'v1.0.2' }}
-          files: dist/V-COMMS.exe
+          tag_name: ${{ github.ref_name }}
+          files: dist/installer/V-COMMS-Setup-*.exe
           body: |
-            # V-COMMS // Real-Time Tactical Voice Engine for Windows 11
+            # V-COMMS // Real-Time Tactical Voice Engine for Windows
 
-            ### Quick Start (No Python Required)
-            1. Download `V-COMMS.exe` attached below.
-            2. Install [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) (Free) if not already installed.
-            3. Set both your Microphone and VB-CABLE to **48,000 Hz (24-bit)** in Windows Sound Control Panel (`mmsys.cpl`).
-            4. Double-click `V-COMMS.exe` to run!
+            ### Install (no Python needed)
+            1. Download `V-COMMS-Setup-<version>.exe` below and run it.
+            2. If your PC doesn't have VB-CABLE yet, Setup installs it (Windows asks for permission once).
+            3. Start V-COMMS from the Start Menu. The first-run setup checks your mic and the cable.
+            4. In VALORANT: Settings > Audio > Voice Chat > Input Device = **CABLE Output (VB-Audio Virtual Cable)**.
+
+            Upgrading from v1.0.2: your profile and custom presets are copied in the first time the new version starts.
+            VB-CABLE is donationware by VB-Audio Software (www.vb-cable.com).

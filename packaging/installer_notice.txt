@@ -2,7 +2,9 @@ V-COMMS - real-time voice changer for VALORANT voice chat
 https://github.com/aayush0000001/VoiceChanger
 
 LICENCE
-V-COMMS is published under the MIT License (as stated in the project's README).
+This Windows build of V-COMMS is distributed under the GNU General Public License v3, because it
+includes PyQt6 and PyQt6-Fluent-Widgets, which are GPLv3. The full text is installed as
+LICENSE-GPL-3.0.txt in the V-COMMS folder. V-COMMS's own source code is MIT-licensed.
 
 V-COMMS is provided "as is", without warranty of any kind.
 
