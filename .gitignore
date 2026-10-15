@@ -40,3 +40,5 @@ weights/
 
 # Screenshots and UI test captures
 screenshots/
+custom_presets.json
+custom_presets.json.bad

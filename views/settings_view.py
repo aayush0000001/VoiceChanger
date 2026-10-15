@@ -12,6 +12,7 @@ from qfluentwidgets import BodyLabel, CaptionLabel, ComboBox, FluentIcon, PushBu
 import qfluentwidgets
 
 from styles import GAP_SM, danger_color, success_color
+from .dialogs import ConfirmDialog
 from .widgets import Card, Chip, GroupCard, PageBase, icon_by_name, muted, set_switch
 
 THEMES = (("Use system setting", "auto"), ("Light", "light"), ("Dark", "dark"))
@@ -24,6 +25,7 @@ class SettingsView(PageBase):
     onnxModelSelected = pyqtSignal(str)         # path to a .onnx file
     profileSaveRequested = pyqtSignal(str)      # path
     profileLoadRequested = pyqtSignal(str)      # path
+    resetAllRequested = pyqtSignal(bool)        # also delete the custom presets? (the window resets the look itself)
     quitRequested = pyqtSignal()                # (handled by the window itself)
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -71,6 +73,19 @@ class SettingsView(PageBase):
             FluentIcon.DOCUMENT, "Load a profile", "tactical_voice_profile.json is loaded on startup.", self.loadButton
         )
         self.content.addWidget(self.profileCard)
+
+        # ---- reset -------------------------------------------------------------------------------------------
+        self.add_section("Reset")
+        self.resetCard = GroupCard("Start fresh")
+        self.resetButton = PushButton(FluentIcon.HISTORY, "Reset all settings…")
+        self.resetButton.clicked.connect(self._ask_reset)
+        self.resetCard.add_row(
+            FluentIcon.HISTORY,
+            "Reset all settings",
+            "Back to the first-launch defaults. Your custom presets are kept unless you choose to delete them.",
+            self.resetButton,
+        )
+        self.content.addWidget(self.resetCard)
 
         # ---- AI --------------------------------------------------------------------------------------------
         self.add_section("AI voice conversion")
@@ -142,6 +157,19 @@ class SettingsView(PageBase):
         path, _ = QFileDialog.getOpenFileName(self, "Load Voice Profile", "", "JSON Files (*.json)")
         if path:
             self.profileLoadRequested.emit(path)
+
+    def _ask_reset(self) -> None:
+        dialog = ConfirmDialog(
+            self.window(),
+            "Reset all settings?",
+            "Voice effects, switches, devices, buffer size and the theme go back to how they were on first launch, "
+            "and your startup profile is rewritten with those defaults. Your custom presets are kept.",
+            "Reset",
+            checkbox_text="Also delete my custom presets",
+        )
+        dialog.accepted.connect(lambda: self.resetAllRequested.emit(dialog.checked()))
+        dialog.finished.connect(dialog.deleteLater)
+        dialog.open()
 
     def _pick_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select ONNX Voice Model", "", "ONNX Models (*.onnx)")

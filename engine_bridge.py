@@ -15,7 +15,9 @@ thread reads them (``AudioEngineManager.read_telemetry``) and emits ``status_upd
 
 from __future__ import annotations
 
+import dataclasses
 import re
+import shutil
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +26,7 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 import engine as eng
+import presets as pr
 
 TELEMETRY_INTERVAL_MS = 33      # ~30 Hz meters and latency readout
 PARAM_FLUSH_INTERVAL_MS = 25    # slider drags are coalesced to at most ~40 snapshot rebuilds per second
@@ -50,10 +53,27 @@ def _split_preset_name(name: str):
     return (m.group(1), m.group(2)) if m else (name, "")
 
 
+def _summary(p: eng.VoiceParameters) -> str:
+    """The few settings that make a custom preset sound the way it does, for its tile."""
+    bits = []
+    if abs(p.pitch_semitones) >= 0.05:
+        bits.append(f"Pitch {p.pitch_semitones:+.1f} st")
+    if abs(p.formant_semitones) >= 0.05:
+        bits.append(f"Formant {p.formant_semitones:+.1f} st")
+    if p.ring_mod_hz >= 0.5 and p.ring_mod_mix >= 0.005:
+        bits.append(f"Ring mod {p.ring_mod_hz:.0f} Hz")
+    if p.drive_db >= 0.05:
+        bits.append(f"Drive {p.drive_db:.1f} dB")
+    if p.reverb_mix >= 0.005:
+        bits.append(f"Reverb {p.reverb_mix * 100:.0f}%")
+    return ", ".join(bits[:3]) or "Plain voice, no effects."
+
+
 class EngineBridge(QObject):
     # ---- bridge -> UI --------------------------------------------------------------------------------------
     ready = pyqtSignal()                  # initial state has been published
-    catalog_ready = pyqtSignal(object)    # {"presets": [...], "hotkeys": [...], "onnx_available": bool, ...}
+    catalog_ready = pyqtSignal(object)    # {"hotkeys": [...], "onnx_available": bool, "preset_rules": {...}, ...}
+    presets_changed = pyqtSignal(object)  # {"presets": [tile data], "custom_names": [str]}: built-ins, then the player's own
     preset_changed = pyqtSignal(str)      # active preset name
     params_changed = pyqtSignal(object)   # {voice parameter: value}
     flags_changed = pyqtSignal(object)    # {bypass_effects, mic_muted, hear_myself, enable_onnx, monitor_volume}
@@ -93,6 +113,7 @@ class EngineBridge(QObject):
         self._running_block_size = self.config.block_size
         self._profile_path = Path(eng.PROFILE_FILENAME)
         self._profile_autoloaded = False
+        self._library = pr.PresetLibrary(self._profile_path.with_name(pr.LIBRARY_FILENAME))  # next to the profile
         self._flush_timer: Optional[QTimer] = None
         self._telemetry_timer: Optional[QTimer] = None
 
@@ -114,7 +135,9 @@ class EngineBridge(QObject):
         cfg = self.config
         self._profile_autoloaded = self._profile_path.is_file() and eng.load_profile_into(cfg, self._profile_path)
         self.engine = eng.AudioEngineManager(cfg)
-        eng.prewarm_filter_designs(cfg.sample_rate)  # so a preset hotkey never has to design filters mid-game
+        self._library.load()
+        # so a preset hotkey (or a click on a saved preset) never has to design filters mid-game
+        eng.prewarm_filter_designs(cfg.sample_rate, extra=self._library.items.values())
 
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
@@ -139,6 +162,8 @@ class EngineBridge(QObject):
         self._publish_everything()
         self._telemetry_timer.start()
         self.ready.emit()
+        if self._library.load_error:
+            self._set_damaged_library_aside()
 
     @pyqtSlot()
     def _shutdown(self) -> None:
@@ -155,13 +180,13 @@ class EngineBridge(QObject):
     # payloads
     # ======================================================================================================
 
-    def _catalog(self) -> dict:
-        presets = []
-        hotkeys = []
+    def _preset_items(self) -> List[dict]:
+        """Tile data: the four built-ins (Ctrl+Alt+F1..F4), then the player's own presets in the order they made them."""
+        items = []
         for n, name in enumerate(eng.TACTICAL_PRESETS, start=1):
             title, tag = _split_preset_name(name)
             blurb, icon = PRESET_META.get(name, ("", "MICROPHONE"))
-            presets.append(
+            items.append(
                 {
                     "key": name,
                     "title": title,
@@ -169,8 +194,37 @@ class EngineBridge(QObject):
                     "hotkey": f"{DEFAULT_HOTKEY_PREFIX}F{n}",
                     "blurb": blurb,
                     "icon": icon,
+                    "custom": False,
                 }
             )
+        for name, params in self._library.items.items():
+            items.append(
+                {
+                    "key": name,
+                    "title": name,
+                    "tag": "Custom",
+                    "hotkey": "Custom",
+                    "blurb": _summary(params),
+                    "icon": "TAG",
+                    "custom": True,
+                }
+            )
+        return items
+
+    def _presets_payload(self) -> dict:
+        return {"presets": self._preset_items(), "custom_names": self._library.names()}
+
+    def _params_for(self, name: str) -> Optional[eng.VoiceParameters]:
+        """A fresh copy of a built-in or custom preset's parameters, or None when there is no such preset."""
+        if name in eng.TACTICAL_PRESETS:
+            return eng.preset_parameters(name)
+        return self._library.get(name)
+
+    def _catalog(self) -> dict:
+        hotkeys = []
+        for n, name in enumerate(eng.TACTICAL_PRESETS, start=1):
+            title, _tag = _split_preset_name(name)
+            blurb, icon = PRESET_META.get(name, ("", "MICROPHONE"))
             hotkeys.append(
                 {
                     "id": getattr(eng.Win32HotkeyListener, f"HK_PRESET_{n}", None),
@@ -199,14 +253,20 @@ class EngineBridge(QObject):
             }
         )
         return {
-            "presets": presets,
             "hotkeys": hotkeys,
             "block_sizes": [
                 {"samples": b, "ms": b / self.config.sample_rate * 1000.0} for b in BLOCK_SIZES
             ],
             "onnx_available": eng.ONNX_AVAILABLE,
             "profile_file": eng.PROFILE_FILENAME,
+            "preset_file": pr.LIBRARY_FILENAME,
             "sample_rate": self.config.sample_rate,
+            # what the naming dialogs need to validate a name as the player types it
+            "preset_rules": {
+                "reserved": sorted(pr.reserved_names()),
+                "name_max": pr.NAME_MAX,
+                "max_custom": pr.MAX_CUSTOM_PRESETS,
+            },
         }
 
     def _flags_payload(self) -> dict:
@@ -262,6 +322,7 @@ class EngineBridge(QObject):
         }
 
     def _publish_everything(self) -> None:
+        self.presets_changed.emit(self._presets_payload())
         self.preset_changed.emit(self.config.active_preset)
         self.params_changed.emit(self._params_payload())
         self.flags_changed.emit(self._flags_payload())
@@ -401,18 +462,22 @@ class EngineBridge(QObject):
 
     @pyqtSlot(str)
     def apply_preset(self, name: str) -> None:
-        if name not in eng.TACTICAL_PRESETS:
+        params = self._params_for(name)
+        if params is None:
             return
         self._pending.clear()
         cfg = self.config
         cfg.active_preset = name
-        cfg.current_params = eng.preset_parameters(name)
+        cfg.current_params = params
         self.engine.dsp.update_parameters(cfg.current_params)
         self.preset_changed.emit(name)
         self.params_changed.emit(self._params_payload())
 
     @pyqtSlot()
     def reset_to_preset(self) -> None:
+        if self._params_for(self.config.active_preset) is None:
+            self._notify("info", "Nothing to reset to", "The active preset is no longer available. Pick another one.")
+            return
         self.apply_preset(self.config.active_preset)
 
     @pyqtSlot(str, float)
@@ -458,6 +523,154 @@ class EngineBridge(QObject):
     @pyqtSlot(float)
     def set_monitor_volume(self, volume: float) -> None:
         self.config.monitor_volume = min(max(float(volume), 0.0), 1.0)
+
+    # ======================================================================================================
+    # the player's own presets (a JSON library next to the profile) and preset files
+    # ======================================================================================================
+
+    def _library_failed(self, title: str, exc: Exception) -> None:
+        if isinstance(exc, pr.PresetError):
+            self._notify("error", title, str(exc))
+        else:
+            reason = getattr(exc, "strerror", None) or str(exc)
+            self._notify("error", title, f"{pr.LIBRARY_FILENAME} could not be written ({reason}).")
+
+    def _set_damaged_library_aside(self) -> None:
+        """A preset file that cannot be read is kept as ``custom_presets.json.bad`` so the next save cannot destroy it."""
+        path = self._library.path
+        aside = path.with_name(path.name + ".bad")
+        try:
+            shutil.copy2(path, aside)
+            kept = f"A copy was kept as {aside.name}."
+        except OSError:
+            kept = ""
+        self._notify("warning", "Custom presets could not be loaded", f"{self._library.load_error}. {kept}".strip())
+
+    @pyqtSlot(str)
+    def save_preset(self, name: str) -> None:
+        """Saves the current voice settings (sliders included) under ``name`` and selects it."""
+        self._flush_params()
+        try:
+            saved = self._library.add(name, self.config.current_params)
+        except (pr.PresetError, OSError) as exc:
+            self._library_failed("Couldn't save the preset", exc)
+            return
+        self.engine.dsp.prepare_parameters(self._library.items[saved])
+        self.config.active_preset = saved
+        self.presets_changed.emit(self._presets_payload())
+        self.preset_changed.emit(saved)
+        self._notify("success", "Preset saved", f"{saved} is on the Live page.")
+
+    @pyqtSlot(str, str)
+    def rename_preset(self, old: str, new: str) -> None:
+        try:
+            renamed = self._library.rename(old, new)
+        except (pr.PresetError, OSError) as exc:
+            self._library_failed("Couldn't rename the preset", exc)
+            return
+        if self.config.active_preset == old:
+            self.config.active_preset = renamed
+        self.presets_changed.emit(self._presets_payload())
+        self.preset_changed.emit(self.config.active_preset)
+        self._notify("success", "Preset renamed", f"{old} is now {renamed}.")
+
+    @pyqtSlot(str)
+    def delete_preset(self, name: str) -> None:
+        was_active = self.config.active_preset == name
+        try:
+            self._library.delete(name)
+        except (pr.PresetError, OSError) as exc:
+            self._library_failed("Couldn't delete the preset", exc)
+            return
+        self.presets_changed.emit(self._presets_payload())
+        fallback = next(iter(eng.TACTICAL_PRESETS))
+        if was_active:
+            self.apply_preset(fallback)  # the voice would otherwise keep a preset that no longer exists
+        title = _split_preset_name(fallback)[0]
+        self._notify("success", "Preset deleted", f"{name} was removed." + (f" Switched to {title}." if was_active else ""))
+
+    def _write_export(self, name: str, params: eng.VoiceParameters, path: str) -> None:
+        try:
+            Path(path).write_text(pr.export_text(name, params), encoding="utf-8")
+        except OSError as exc:
+            self._notify("error", "Couldn't export the preset", f"{Path(path).name} could not be written ({exc.strerror or exc}).")
+            return
+        self._notify("success", "Preset exported", Path(path).name)
+
+    @pyqtSlot(str, str)
+    def export_preset(self, key: str, path: str) -> None:
+        params = self._params_for(key)
+        if params is None:
+            self._notify("error", "Couldn't export the preset", "That preset no longer exists.")
+            return
+        self._write_export(key, params, path)
+
+    @pyqtSlot(str)
+    def export_current(self, path: str) -> None:
+        """The voice exactly as it sounds now, sliders included, whichever preset it started from."""
+        self._flush_params()
+        cfg = self.config
+        name = cfg.active_preset
+        if name not in self._library.items:
+            name = f"My {_split_preset_name(name)[0]}"
+        self._write_export(name, cfg.current_params, path)
+
+    @pyqtSlot(str)
+    def import_preset(self, path: str) -> None:
+        """Reads a preset file as data only. A name that is taken (or reserved) gets a number: 'Name (2)'."""
+        try:
+            wanted, params = pr.parse_preset_file(Path(path))
+            saved = self._library.add(pr.unique_name(wanted, self._library.names()), params)
+        except (pr.PresetError, OSError) as exc:
+            self._library_failed("Couldn't import the preset", exc)
+            return
+        self.engine.dsp.prepare_parameters(self._library.items[saved])
+        self.presets_changed.emit(self._presets_payload())
+        self.apply_preset(saved)
+        renamed = " (that name was taken)" if saved != pr.normalize_name(wanted) else ""
+        self._notify("success", "Preset imported", f"{saved} is selected{renamed}.")
+
+    @pyqtSlot(bool)
+    def reset_all(self, delete_presets: bool) -> None:
+        """
+        Everything back to the first-launch state: effects, switches, devices (auto-detected again), buffer size and
+        the saved startup profile. The player's presets are kept unless ``delete_presets``. A running engine keeps
+        its streams until it is restarted, as when the device boxes are changed by hand.
+        """
+        if self._path_test_running:
+            self._notify("warning", "Test in progress", "Wait for the audio path test to finish, then reset.")
+            return
+        cfg = self.config
+        running = bool(self.engine.is_running)
+        self._pending.clear()
+        defaults = eng.AppConfig()
+        for f in dataclasses.fields(defaults):          # in place: the audio engine holds this same object
+            if f.name != "current_params":
+                setattr(cfg, f.name, getattr(defaults, f.name))
+        cfg.current_params = eng.preset_parameters(cfg.active_preset)
+        self.engine.dsp.update_parameters(cfg.current_params)
+        self.engine.dsp.onnx_streamer.unload()
+
+        problems = []
+        if delete_presets and self._library.items:
+            try:
+                self._library.clear()
+            except OSError as exc:
+                problems.append(f"{pr.LIBRARY_FILENAME} could not be updated ({exc.strerror or exc})")
+        self._scan_devices(refresh=not running)
+        if self._profile_path.is_file():                # the file that is loaded on every start
+            try:
+                eng.save_profile(cfg, self._profile_path)
+            except OSError as exc:
+                problems.append(f"{self._profile_path.name} could not be rewritten ({exc.strerror or exc})")
+
+        self._publish_everything()
+        if problems:
+            self._notify("warning", "Reset, with a problem", "; ".join(problems) + ".")
+            return
+        kept = "Custom presets were deleted." if delete_presets else "Your custom presets were kept."
+        later = " Devices and buffer size apply when you restart the audio engine." if running else ""
+        self._notify("success", "Settings reset", f"Everything is back to its defaults. {kept}{later}")
 
     # ======================================================================================================
     # hotkeys

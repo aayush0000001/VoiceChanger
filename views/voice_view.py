@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
-from qfluentwidgets import FluentIcon, PushButton
+from qfluentwidgets import Action, FluentIcon, PushButton, RoundMenu
 
+import preset_names
 from styles import GAP
-from .widgets import Card, PageBase, ReflowGrid, SliderRow
+from .dialogs import NameDialog, ask_preset_export_path, ask_preset_import_path
+from .widgets import Card, PageBase, QuietDropDownButton, ReflowGrid, SliderRow
 
 # name, title, min, max, scale (slider steps per unit), unit
 GROUPS = [
@@ -54,13 +56,26 @@ GROUPS = [
 class VoiceView(PageBase):
     paramChanged = pyqtSignal(str, float)   # voice parameter name, new value
     resetRequested = pyqtSignal()           # re-apply the active preset
+    presetSaveRequested = pyqtSignal(str)   # save the current settings under this name
+    presetImportRequested = pyqtSignal(str)     # path of a preset file
+    exportCurrentRequested = pyqtSignal(str)    # path to write the current settings to
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__("voiceView", "Voice", "Fine-tune the active preset. Changes apply instantly.", parent)
         self.rows: Dict[str, SliderRow] = {}
+        self._custom_names: List[str] = []
+        self._reserved: List[str] = []
 
+        self.presetsButton = QuietDropDownButton(FluentIcon.TAG, "Presets")
+        menu = RoundMenu(parent=self)
+        menu.addAction(Action(FluentIcon.SAVE, "Save as preset…", triggered=self._save_as_preset))
+        menu.addAction(Action(FluentIcon.DOWNLOAD, "Import preset…", triggered=self._import_preset))
+        menu.addSeparator()
+        menu.addAction(Action(FluentIcon.SHARE, "Export current settings…", triggered=self._export_current))
+        self.presetsButton.setMenu(menu)
         self.resetButton = PushButton(FluentIcon.SYNC, "Reset to preset")
         self.resetButton.clicked.connect(self.resetRequested)
+        self.actions.addWidget(self.presetsButton)
         self.actions.addWidget(self.resetButton)
 
         # two columns: pitch + character on the left, gate + reverb + output on the right
@@ -88,8 +103,43 @@ class VoiceView(PageBase):
         lay.setSpacing(GAP)
         return col
 
+    # ------------------------------------------------------------------ preset actions (dialogs live here)
+    def _save_as_preset(self) -> None:
+        suggestion = preset_names.unique_name("My preset", self._custom_names, self._reserved)
+        dialog = NameDialog(
+            self.window(),
+            "Save as preset",
+            "Save",
+            self._custom_names,
+            self._reserved,
+            initial=suggestion,
+            caption="Saves every slider as it is now. It appears next to the built-in voices on the Live page.",
+        )
+        dialog.accepted.connect(lambda: self.presetSaveRequested.emit(dialog.name()))
+        dialog.finished.connect(dialog.deleteLater)
+        dialog.open()
+
+    def _import_preset(self) -> None:
+        path = ask_preset_import_path(self.window())
+        if path:
+            self.presetImportRequested.emit(path)
+
+    def _export_current(self) -> None:
+        path = ask_preset_export_path(self.window(), self._active_name or "My voice")
+        if path:
+            self.exportCurrentRequested.emit(path)
+
     # ------------------------------------------------------------------ slots (bridge -> view)
+    _active_name = ""
+
+    def set_catalog(self, data: dict) -> None:
+        self._reserved = list(data["preset_rules"]["reserved"])
+
+    def set_presets(self, data: dict) -> None:
+        self._custom_names = list(data["custom_names"])
+
     def apply_preset(self, name: str) -> None:
+        self._active_name = name
         self.captionLabel.setText(f"Fine-tune the active preset: {name}. Changes apply instantly.")
 
     def apply_params(self, params: dict) -> None:

@@ -5,8 +5,8 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QKeyEvent, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QContextMenuEvent, QFont, QFontMetrics, QKeyEvent, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -18,10 +18,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from qfluentwidgets import (
+    Action,
     BodyLabel,
     CaptionLabel,
     CardWidget,
     ComboBox,
+    DropDownPushButton,
     FluentIcon,
     GroupHeaderCardWidget,
     HeaderCardWidget,
@@ -29,12 +31,15 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarIcon,
     InfoBarPosition,
+    MenuAnimationType,
+    RoundMenu,
     ScrollArea,
     Slider,
     StrongBodyLabel,
     SubtitleLabel,
     SwitchButton,
     TitleLabel,
+    TransparentToolButton,
     getFont,
     isDarkTheme,
     qconfig,
@@ -91,12 +96,11 @@ def tighten_group_card(card: GroupHeaderCardWidget) -> GroupHeaderCardWidget:
     return card
 
 
-class ElidedCaption(CaptionLabel):
-    """One-line caption that ends in an ellipsis instead of forcing its card (and the page) wider.
-    The full text stays in the tooltip."""
+class _ElideMixin:
+    """One-line label text that ends in an ellipsis instead of forcing its card (and the page) wider. The full
+    text stays in the tooltip. Mix in before the label class."""
 
-    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
-        super().__init__(parent)  # (the str overload re-enters __init__ with the wrong arguments in subclasses)
+    def _start_eliding(self, text: str) -> None:
         self._full = ""
         self._mode = Qt.TextElideMode.ElideRight
         self.setText(text)
@@ -130,6 +134,18 @@ class ElidedCaption(CaptionLabel):
 
     def minimumSizeHint(self) -> QSize:
         return QSize(40, super().minimumSizeHint().height())
+
+
+class ElidedCaption(_ElideMixin, CaptionLabel):
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+        CaptionLabel.__init__(self, parent)  # (the str overload re-enters __init__ with the wrong arguments in subclasses)
+        self._start_eliding(text)
+
+
+class ElidedStrongLabel(_ElideMixin, StrongBodyLabel):
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+        StrongBodyLabel.__init__(self, parent)
+        self._start_eliding(text)
 
 
 def tidy_group_row(group) -> None:
@@ -675,39 +691,82 @@ class ElidedComboBox(ComboBox):
         return QSize(self.width(), 33)
 
 
+class QuietDropDownButton(DropDownPushButton):
+    """DropDownPushButton whose menu simply appears: the stock slide-down animation repaints while audio may be live."""
+
+    def _showMenu(self) -> None:
+        menu = self.menu()
+        if not menu:
+            return
+        menu.view.setMinimumWidth(self.width())
+        menu.view.adjustSize()
+        menu.adjustSize()
+        x = -menu.width() // 2 + menu.layout().contentsMargins().left() + self.width() // 2
+        menu.exec(self.mapToGlobal(QPoint(x, self.height())), aniType=MenuAnimationType.NONE)
+
+
 # ======================================================================================================
 # preset tile
 # ======================================================================================================
 
 class PresetTile(CardWidget):
-    """Clickable voice-preset card: hotkey chip, name, character tag, one-line description, 'active' check."""
+    """
+    Clickable voice-preset card: hotkey chip, name, character tag, one-line description, 'active' check. A custom
+    (player-made) tile shows a 'Custom' chip instead of a hotkey and a "..." button with Rename, Export and Delete.
+    """
 
     chosen = pyqtSignal(str)
+    renameRequested = pyqtSignal(str)
+    exportRequested = pyqtSignal(str)
+    deleteRequested = pyqtSignal(str)
     _selected = False
 
+    TOP_ROW = 24          # tiles in one row line up whether or not they carry the "..." button
+    MORE_SIZE = 24
+
     def __init__(
-        self, key: str, title: str, tag: str, hotkey: str, blurb: str, icon, parent: Optional[QWidget] = None
+        self,
+        key: str,
+        title: str,
+        tag: str,
+        hotkey: str,
+        blurb: str,
+        icon,
+        custom: bool = False,
+        parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.key = key
+        self.custom = custom
+        self._menu: Optional[RoundMenu] = None
         self.setBorderRadius(CARD_RADIUS)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumHeight(152)
-        self.setAccessibleName(f"{title} voice preset, {hotkey}")
+        self.setAccessibleName(f"{title}, custom voice preset" if custom else f"{title} voice preset, {hotkey}")
 
-        self.keyChip = Chip(hotkey)
+        self.keyChip = Chip(hotkey, accent=custom)
         self.iconWidget = IconWidget(icon)
         self.iconWidget.setFixedSize(20, 20)
-        self.titleLabel = StrongBodyLabel(title)
-        self.tagLabel = muted(CaptionLabel(tag))
+        self.titleLabel = ElidedStrongLabel(title)
+        self.tagLabel = muted(ElidedCaption(tag))
         self.blurbLabel = muted(CaptionLabel(blurb))
         self.blurbLabel.setWordWrap(True)
 
-        top = QHBoxLayout()
+        top_host = QWidget()
+        top_host.setFixedHeight(self.TOP_ROW)
+        top = QHBoxLayout(top_host)
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(self.keyChip)
         top.addStretch(1)
+        self.moreButton: Optional[TransparentToolButton] = None
+        if custom:
+            self.moreButton = TransparentToolButton(FluentIcon.MORE, self)
+            self.moreButton.setFixedSize(self.MORE_SIZE, self.MORE_SIZE)
+            self.moreButton.setToolTip("Rename, export or delete")
+            self.moreButton.setAccessibleName(f"{title} options")
+            self.moreButton.clicked.connect(self._open_menu_at_button)
+            top.addWidget(self.moreButton)
         names = QVBoxLayout()
         names.setContentsMargins(0, 0, 0, 0)
         names.setSpacing(0)
@@ -722,12 +781,38 @@ class PresetTile(CardWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(CARD_PADDING, GAP, CARD_PADDING, GAP)
         lay.setSpacing(GAP_SM)
-        lay.addLayout(top)
+        lay.addWidget(top_host)
         lay.addLayout(identity)
         lay.addWidget(self.blurbLabel)
         lay.addStretch(1)
 
         self.clicked.connect(self._emit)
+
+    # ------------------------------------------------------------------ the "..." menu of a custom tile
+    def _build_menu(self) -> RoundMenu:
+        if self._menu is None:
+            menu = RoundMenu(parent=self)
+            menu.addAction(Action(FluentIcon.EDIT, "Rename…", triggered=lambda: self.renameRequested.emit(self.key)))
+            menu.addAction(Action(FluentIcon.SHARE, "Export…", triggered=lambda: self.exportRequested.emit(self.key)))
+            menu.addSeparator()
+            menu.addAction(Action(FluentIcon.DELETE, "Delete…", triggered=lambda: self.deleteRequested.emit(self.key)))
+            self._menu = menu
+        return self._menu
+
+    def _open_menu(self, global_pos: QPoint) -> None:
+        # no slide animation: it would repaint while the audio engine may be live
+        self._build_menu().exec(global_pos, aniType=MenuAnimationType.NONE)
+
+    def _open_menu_at_button(self) -> None:
+        button = self.moreButton
+        self._open_menu(button.mapToGlobal(QPoint(0, button.height() + 2)))
+
+    def contextMenuEvent(self, e: QContextMenuEvent) -> None:
+        if self.custom:
+            self._open_menu(e.globalPos())
+            e.accept()
+        else:
+            super().contextMenuEvent(e)
 
     def _emit(self) -> None:
         self.chosen.emit(self.key)
@@ -769,8 +854,9 @@ class PresetTile(CardWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(accent, 2))
             p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), CARD_RADIUS, CARD_RADIUS)
-            # check badge, top right
-            c = QPointF(self.width() - CARD_PADDING - 10, GAP + 11)
+            # check badge, top right (left of the "..." button on a custom tile)
+            shift = self.MORE_SIZE + GAP_SM if self.custom else 0
+            c = QPointF(self.width() - CARD_PADDING - 10 - shift, GAP + self.TOP_ROW / 2)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent)
             p.drawEllipse(c, 10, 10)

@@ -139,9 +139,16 @@ class MainWindow(FluentWindow):
         lv.engineToggleRequested.connect(b.toggle_engine)
         self.engineToggleRequested.connect(b.toggle_engine)
         lv.presetRequested.connect(b.apply_preset)
+        lv.presetRenameRequested.connect(b.rename_preset)
+        lv.presetExportRequested.connect(b.export_preset)
+        lv.presetDeleteRequested.connect(b.delete_preset)
+        lv.presetImportRequested.connect(b.import_preset)
         lv.flagToggled.connect(b.set_flag)
         vv.paramChanged.connect(b.set_param)
         vv.resetRequested.connect(b.reset_to_preset)
+        vv.presetSaveRequested.connect(b.save_preset)
+        vv.presetImportRequested.connect(b.import_preset)
+        vv.exportCurrentRequested.connect(b.export_current)
         dv.deviceSelected.connect(b.select_device)
         dv.blockSizeSelected.connect(b.set_block_size)
         dv.rescanRequested.connect(b.rescan_devices)
@@ -152,11 +159,15 @@ class MainWindow(FluentWindow):
         sv.onnxModelSelected.connect(b.load_onnx_model)
         sv.profileSaveRequested.connect(b.save_profile)
         sv.profileLoadRequested.connect(b.load_profile)
+        sv.resetAllRequested.connect(b.reset_all)
         self.telemetryActive.connect(b.set_telemetry_active)
 
         # bridge -> views  (state; delivered on the GUI thread)
         b.catalog_ready.connect(lv.set_catalog)
+        b.catalog_ready.connect(vv.set_catalog)
         b.catalog_ready.connect(sv.set_catalog)
+        b.presets_changed.connect(lv.set_presets)
+        b.presets_changed.connect(vv.set_presets)
         b.preset_changed.connect(lv.apply_preset)
         b.preset_changed.connect(vv.apply_preset)
         b.params_changed.connect(vv.apply_params)
@@ -180,6 +191,7 @@ class MainWindow(FluentWindow):
         # appearance is the window's own business (no engine involved)
         sv.themeSelected.connect(self.set_theme)
         sv.micaToggled.connect(self.set_mica)
+        sv.resetAllRequested.connect(self.reset_appearance)
         sv.quitRequested.connect(self.quit_app)
         self.themeListener.systemThemeChanged.connect(self._on_system_theme_changed)
 
@@ -212,6 +224,12 @@ class MainWindow(FluentWindow):
         self.settings.setValue("appearance/mica", enabled)
         if mica_supported():
             self.setMicaEffectEnabled(enabled)
+
+    def reset_appearance(self, *_args) -> None:
+        """Part of 'Reset all settings': follow Windows' theme again and bring Mica back."""
+        self.set_theme("auto")
+        self.set_mica(True)
+        self.settingsView.apply_appearance("auto", mica_supported(), True)
 
     def _on_system_theme_changed(self) -> None:
         setTheme(Theme.AUTO)

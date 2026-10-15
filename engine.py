@@ -26,7 +26,7 @@ import time
 import tracemalloc
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 from scipy import signal
@@ -66,6 +66,22 @@ class VoiceParameters:
     reverb_mix: float = 0.0             # 0.0 to 0.60
     drive_db: float = 0.0               # 0.0 to 18.0 dB
     output_gain_db: float = 0.0         # -12.0 to +12.0 dB
+
+
+# The slider range of every voice parameter (the Voice page uses the same numbers). Anything that arrives from outside
+# the app, such as an imported preset, is clamped to these before it can reach the DSP.
+PARAM_RANGES: Dict[str, Tuple[float, float]] = {
+    "pitch_semitones": (-12.0, 12.0),
+    "formant_semitones": (-6.0, 6.0),
+    "gate_threshold_db": (-70.0, -15.0),
+    "hpf_cutoff_hz": (20.0, 600.0),
+    "lpf_cutoff_hz": (1500.0, 16000.0),
+    "ring_mod_hz": (0.0, 100.0),
+    "ring_mod_mix": (0.0, 1.0),
+    "reverb_mix": (0.0, 0.6),
+    "drive_db": (0.0, 18.0),
+    "output_gain_db": (-12.0, 12.0),
+}
 
 
 TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
@@ -496,6 +512,12 @@ class ONNXVoiceStreamer:
             self.active = False
             return False, str(exc)
 
+    def unload(self) -> None:
+        """Forgets the model (and frees its memory). The audio thread checks ``active`` before every inference."""
+        self.active = False
+        self.session = None
+        self.input_name = ""
+
     def process_into(self, x: np.ndarray) -> None:
         if not self.active or self.session is None:
             return
@@ -566,6 +588,8 @@ class RealTimeDSPChain:
         sos = _PINNED_DESIGNS.get(key)
         if sos is None:
             sos = _SWEEP_DESIGNS.get(key)
+            if sos is not None and pin:
+                _PINNED_DESIGNS[key] = sos
         if sos is None:
             sos = build()
             if pin:
@@ -633,6 +657,11 @@ class RealTimeDSPChain:
     def update_parameters(self, new_params: VoiceParameters) -> None:
         """Wait-free atomic pointer swap from UI thread."""
         self._snapshot = self._compile_snapshot(new_params)
+
+    def prepare_parameters(self, params: VoiceParameters) -> None:
+        """Designs and keeps the filters these parameters need without applying them, so that switching to a saved
+        preset later is only a pointer swap."""
+        self._compile_snapshot(params, pin=True)
 
     def process_block(self, audio_in: np.ndarray, use_onnx: bool = False) -> np.ndarray:
         """
@@ -1154,14 +1183,15 @@ def preset_parameters(name: str) -> VoiceParameters:
     return VoiceParameters(**asdict(TACTICAL_PRESETS[name]))
 
 
-def prewarm_filter_designs(sample_rate: int = 48000) -> None:
+def prewarm_filter_designs(sample_rate: int = 48000, extra: Iterable[VoiceParameters] = ()) -> None:
     """
-    Designs the filters every built-in preset needs (a few ms each) while nothing is running, so switching
-    presets later, by hotkey in the middle of a match, only swaps a pointer instead of redesigning them.
+    Designs the filters every built-in preset (and any ``extra`` ones, such as the player's saved presets) needs, a
+    few ms each, while nothing is running, so switching presets later, by hotkey in the middle of a match, only
+    swaps a pointer instead of redesigning them.
     """
     chain = RealTimeDSPChain(sample_rate)
-    for params in TACTICAL_PRESETS.values():
-        chain._compile_snapshot(params, pin=True)
+    for params in list(TACTICAL_PRESETS.values()) + list(extra):
+        chain.prepare_parameters(params)
 
 
 def load_profile_into(config: AppConfig, path: Path) -> bool:
