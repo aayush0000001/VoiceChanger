@@ -876,6 +876,141 @@ class AudioEngineManager(QObject):
         self.status_changed.emit("STOPPED")
 
 
+def run_audio_path_test(
+    in_idx: int,
+    out_idx: int,
+    params: VoiceParameters,
+    sample_rate: int = 48000,
+    block_size: int = 256,
+) -> Tuple[bool, List[str]]:
+    """
+    Verifies the full routing chain on real hardware, one stage at a time:
+      1. Records 2 s from the selected mic and checks that it picks up sound.
+      2. Runs that recording through the DSP chain and checks output and block timing.
+      3. If the output is VB-CABLE, plays a 1 kHz tone into "CABLE Input" while recording
+         "CABLE Output" (what Valorant hears) and checks that the tone arrives.
+    Must not run while the audio engine holds the devices.
+    """
+    if not SOUNDDEVICE_AVAILABLE:
+        return False, ["[FAIL] sounddevice library not installed."]
+
+    lines: List[str] = []
+    passed = True
+    hostapis = sd.query_hostapis()
+
+    def shared_settings(dev_idx: int):
+        api_name = hostapis[sd.query_devices(dev_idx)["hostapi"]]["name"]
+        if "WASAPI" in api_name.upper() and hasattr(sd, "WasapiSettings"):
+            return sd.WasapiSettings(exclusive=False, auto_convert=True)
+        return None
+
+    def to_db(value: float) -> float:
+        return max(-80.0, 20.0 * float(np.log10(value + 1e-12)))
+
+    # 1. Microphone capture
+    mic = sd.rec(
+        int(2.0 * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        device=in_idx,
+        extra_settings=shared_settings(in_idx),
+    )
+    sd.wait()
+    mic = np.ascontiguousarray(mic[:, 0])
+    mic_peak_db = to_db(float(np.max(np.abs(mic))))
+    mic_rms_db = to_db(float(np.sqrt(np.mean(mic * mic))))
+    if mic_peak_db < -50.0:
+        passed = False
+        lines.append(
+            f"[FAIL] Mic: silent (peak {mic_peak_db:.1f} dBFS). Check the device and Windows mic privacy settings."
+        )
+    else:
+        lines.append(f"[PASS] Mic: peak {mic_peak_db:.1f} dBFS, average {mic_rms_db:.1f} dBFS.")
+
+    # 2. DSP chain on the recorded voice
+    dsp = RealTimeDSPChain(sample_rate)
+    dsp.update_parameters(params)
+    n_blocks = len(mic) // block_size
+    processed = np.zeros(n_blocks * block_size, dtype=np.float32)
+    timings_ms: List[float] = []
+    for i in range(n_blocks):
+        block = mic[i * block_size : (i + 1) * block_size]
+        t0 = time.perf_counter()
+        processed[i * block_size : (i + 1) * block_size] = dsp.process_block(block)
+        timings_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    deadline_ms = (block_size / sample_rate) * 1000.0
+    p99 = float(np.percentile(timings_ms, 99))
+    if not np.all(np.isfinite(processed)) or float(np.max(np.abs(processed))) > 0.90:
+        passed = False
+        lines.append("[FAIL] DSP: output contains invalid samples or exceeds the limiter ceiling.")
+    elif p99 >= deadline_ms:
+        passed = False
+        lines.append(
+            f"[FAIL] DSP: slowest blocks take {p99:.2f} ms, over the {deadline_ms:.2f} ms budget. "
+            "Expect crackling; try a larger buffer size."
+        )
+    else:
+        lines.append(f"[PASS] DSP: slowest blocks take {p99:.2f} ms of a {deadline_ms:.2f} ms budget.")
+
+    # 3. VB-CABLE loopback (what the game actually receives)
+    out_info = sd.query_devices(out_idx)
+    if "CABLE" not in out_info["name"].upper():
+        lines.append(
+            f"[SKIP] Cable: output '{out_info['name']}' is not VB-CABLE, so the game-side check was skipped."
+        )
+        return passed, lines
+
+    cable_rec_idx = None
+    for idx, dev in enumerate(sd.query_devices()):
+        if (
+            dev["max_input_channels"] > 0
+            and dev["hostapi"] == out_info["hostapi"]
+            and "CABLE OUTPUT" in dev["name"].upper()
+        ):
+            cable_rec_idx = idx
+            break
+    if cable_rec_idx is None:
+        lines.append("[FAIL] Cable: could not find the 'CABLE Output' recording device.")
+        return False, lines
+
+    lead = int(0.25 * sample_rate)
+    t = np.arange(int(1.5 * sample_rate), dtype=np.float32) / sample_rate
+    tone = np.concatenate([np.zeros(lead, dtype=np.float32), 0.25 * np.sin(2.0 * np.pi * 1000.0 * t)])
+    out_ch = min(2, max(1, out_info["max_output_channels"]))
+    captured = sd.playrec(
+        np.tile(tone[:, None], (1, out_ch)).astype(np.float32),
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        device=(cable_rec_idx, out_idx),
+        extra_settings=shared_settings(out_idx),
+    )
+    sd.wait()
+    captured = captured[:, 0]
+
+    onset = np.flatnonzero(np.abs(captured) > 0.025)
+    if onset.size == 0:
+        lines.append("[FAIL] Cable: nothing arrived on 'CABLE Output'. Check that VB-CABLE is enabled in Windows.")
+        return False, lines
+
+    segment = captured[onset[0] : onset[0] + sample_rate // 2]
+    spectrum = np.abs(np.fft.rfft(segment * np.hanning(len(segment))))
+    peak_hz = float(np.argmax(spectrum)) * sample_rate / len(segment)
+    level_db = to_db(float(np.sqrt(np.mean(segment * segment))))
+    latency_ms = (onset[0] - lead) * 1000.0 / sample_rate
+    if abs(peak_hz - 1000.0) > 20.0:
+        passed = False
+        lines.append(f"[FAIL] Cable: signal arrived but is distorted (strongest tone at {peak_hz:.0f} Hz).")
+    else:
+        lines.append(
+            f"[PASS] Cable: test tone reached 'CABLE Output' at {level_db:.1f} dBFS, "
+            f"about {max(latency_ms, 0.0):.0f} ms after it was sent."
+        )
+    return passed, lines
+
+
 # ============================================================================
 # 5. VANGUARD-SAFE WIN32 GLOBAL HOTKEY THREAD (ZERO-HOOK RegisterHotKey API)
 # ============================================================================
@@ -995,6 +1130,7 @@ class LevelMeterWidget(QWidget):
 
 class TacticalVoiceWindow(QMainWindow):
     hotkey_triggered = Signal(int)
+    path_test_finished = Signal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -1013,6 +1149,7 @@ class TacticalVoiceWindow(QMainWindow):
 
         self.audio.status_changed.connect(self.lbl_status.setText)
         self.hotkey_triggered.connect(self._handle_hotkey)
+        self.path_test_finished.connect(self._on_path_test_finished)
 
         self.hotkey_thread = Win32HotkeyListener(self.hotkey_triggered.emit)
         self.hotkey_thread.start()
@@ -1146,6 +1283,10 @@ class TacticalVoiceWindow(QMainWindow):
         self.btn_toggle_engine.clicked.connect(self._toggle_engine)
         dev_grid.addWidget(self.btn_toggle_engine, 2, 2, 1, 2)
 
+        self.btn_test_path = QPushButton("TEST AUDIO PATH (Mic -> DSP -> Cable)")
+        self.btn_test_path.clicked.connect(self._run_path_test)
+        dev_grid.addWidget(self.btn_test_path, 3, 0, 1, 4)
+
         root_layout.addWidget(dev_group)
 
         # 2. Real-Time VU Meters
@@ -1256,15 +1397,15 @@ class TacticalVoiceWindow(QMainWindow):
 
         out_target_idx = 0
         mon_target_idx = 0
+        # Outputs are listed WASAPI-first, so the first "CABLE Input" match is the WASAPI endpoint
+        cable_idx = next((i for i, (_, label) in enumerate(outputs) if "CABLE INPUT" in label.upper()), None)
         for i, (idx, label) in enumerate(outputs):
             self.cmb_output.addItem(label, idx)
             self.cmb_monitor.addItem(label, idx)
             if self.config.output_device_name and self.config.output_device_name in label:
                 out_target_idx = i
-            elif not self.config.output_device_name and (
-                "CABLE INPUT" in label.upper() or "VB-AUDIO" in label.upper()
-            ):
-                out_target_idx = i
+            elif not self.config.output_device_name and cable_idx is not None:
+                out_target_idx = cable_idx
 
             if self.config.monitor_device_name and self.config.monitor_device_name in label:
                 mon_target_idx = i
@@ -1371,6 +1512,42 @@ class TacticalVoiceWindow(QMainWindow):
 
         if self.audio.start_engine(in_idx, out_idx, mon_idx):
             self.btn_toggle_engine.setText("STOP AUDIO ENGINE")
+
+    def _run_path_test(self) -> None:
+        if self.audio.is_running:
+            QMessageBox.information(self, "Audio Path Test", "Stop the audio engine before running the test.")
+            return
+        in_idx = self.cmb_input.currentData()
+        out_idx = self.cmb_output.currentData()
+        if in_idx is None or out_idx is None:
+            QMessageBox.warning(self, "Device Error", "Please select valid input and output devices.")
+            return
+
+        params = VoiceParameters(**asdict(self.config.current_params))
+        block_size = int(self.cmb_blocksize.currentData())
+        self.btn_test_path.setEnabled(False)
+        self.btn_toggle_engine.setEnabled(False)
+        self.btn_test_path.setText("TESTING... SPEAK INTO YOUR MIC")
+
+        def worker() -> None:
+            try:
+                passed, lines = run_audio_path_test(
+                    in_idx, out_idx, params, self.config.sample_rate, block_size
+                )
+            except Exception as exc:
+                passed, lines = False, [f"[FAIL] Audio error: {exc}"]
+            self.path_test_finished.emit(passed, "\n".join(lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_path_test_finished(self, passed: bool, report: str) -> None:
+        self.btn_test_path.setEnabled(True)
+        self.btn_toggle_engine.setEnabled(True)
+        self.btn_test_path.setText("TEST AUDIO PATH (Mic -> DSP -> Cable)")
+        if passed:
+            QMessageBox.information(self, "Audio Path Test: PASSED", report)
+        else:
+            QMessageBox.warning(self, "Audio Path Test: FAILED", report)
 
     def _browse_onnx_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
