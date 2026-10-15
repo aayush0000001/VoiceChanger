@@ -1,0 +1,23 @@
+V-COMMS - real-time voice changer for VALORANT voice chat
+https://github.com/aayush0000001/VoiceChanger
+
+LICENCE
+V-COMMS is published under the MIT License (as stated in the project's README).
+
+V-COMMS is provided "as is", without warranty of any kind.
+
+WHAT SETUP DOES
+- Installs V-COMMS for your Windows account only (no administrator rights needed).
+- Installs VB-CABLE, the free virtual audio cable V-COMMS needs, only if this PC does not have it yet.
+  Installing that driver is the one step Windows asks permission for.
+- Keeps your settings and presets in your AppData folder, so upgrades never lose them.
+
+V-COMMS never reads or writes game memory and never installs keyboard hooks.
+
+INCLUDED THIRD-PARTY SOFTWARE
+- VB-CABLE Virtual Audio Device by VB-Audio Software (V. Burel), www.vb-cable.com.
+  VB-CABLE is donationware: all participations are welcome.
+- Qt 6 (LGPLv3) and PyQt6 (GPLv3) by The Qt Company and Riverbank Computing
+- PyQt6-Fluent-Widgets (GPLv3) by zhiyiYo
+- Python (PSF licence), NumPy and SciPy (BSD), sounddevice and PortAudio (MIT),
+  ONNX Runtime with DirectML (MIT) by Microsoft
