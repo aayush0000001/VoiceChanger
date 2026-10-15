@@ -32,6 +32,11 @@ _EMAIL = re.compile(r"^[^@\s,;<>()\"']+@[^@\s,;<>()\"']+\.[A-Za-z]{2,}$")
 
 
 # ------------------------------------------------------------------------------------------------ the form
+def valid_email(address: str) -> bool:
+    address = address.strip()
+    return 0 < len(address) <= REPLY_TO_MAX and bool(_EMAIL.match(address))
+
+
 def validate(report_type: str, summary: str, description: str, reply_to: str) -> Dict[str, str]:
     """Field name -> message for everything wrong with the form (empty when it is fine to send)."""
     errors: Dict[str, str] = {}
@@ -48,13 +53,18 @@ def validate(report_type: str, summary: str, description: str, reply_to: str) ->
     elif len(description) > DESCRIPTION_MAX:
         errors["description"] = f"Keep the description under {DESCRIPTION_MAX} characters."
     reply_to = reply_to.strip()
-    if reply_to and (len(reply_to) > REPLY_TO_MAX or not _EMAIL.match(reply_to)):
+    if reply_to and not valid_email(reply_to):
         errors["reply_to"] = "That does not look like an email address."
     return errors
 
 
 def build_title(report_type: str, summary: str) -> str:
     return f"[{APP_NAME} {APP_VERSION}] {report_type}: {' '.join(summary.split())}"
+
+
+def report_text(title: str, body: str) -> str:
+    """The whole report as one block of text (what the dialog previews and the clipboard fallback copies)."""
+    return f"Subject: {title}\n\n{body}"
 
 
 def build_body(description: str, reply_to: str, diagnostics: Optional[str]) -> str:
@@ -70,6 +80,11 @@ def build_body(description: str, reply_to: str, diagnostics: Optional[str]) -> s
 def is_placeholder(endpoint: str) -> bool:
     """True until a real https://formspree.io/f/<id> URL is set in report_config.py."""
     return "REPLACE_WITH" in endpoint or not endpoint.startswith("https://")
+
+
+def is_placeholder_address(address: str) -> bool:
+    """True while MAILTO_ADDRESS is still the example one, so there is nobody to mail yet."""
+    return not address or address.lower().endswith((".invalid", "@example.com", "@example.org", "@example.net"))
 
 
 def mailto_url(address: str, title: str, body: str, body_limit: int = report_config.MAILTO_BODY_LIMIT) -> str:
@@ -114,9 +129,10 @@ def post_report(
     body: str,
     reply_to: str,
     timeout: float = report_config.REQUEST_TIMEOUT_S,
-    opener: Callable = _default_open,
+    opener: Optional[Callable] = None,
 ) -> None:
     """HTTPS POST of the report to a form service. Raises ``ReportError`` with a short reason when it fails."""
+    opener = opener or _default_open  # looked up when called, so a test can swap it
     if not endpoint.startswith("https://"):
         raise ReportError("the form address is not an https:// URL")
     fields = {"_subject": title[:200], "message": body[:BODY_MAX], "app_version": APP_VERSION}
@@ -183,13 +199,14 @@ def submit(
     limiter: RateLimiter,
     endpoint: Optional[str] = None,
     address: Optional[str] = None,
-    opener: Callable = _default_open,
+    opener: Optional[Callable] = None,
 ) -> Dict:
     """
     Delivers one report and says how it went; call it off the UI thread. The result is a dict:
       {"status": "sent"}                                                  the form service accepted it
-      {"status": "fallback", "reason": "no_key"|"failed", "detail": str, "mailto": url}
-                                                                          open the mail link (the report is in it)
+      {"status": "fallback", "reason": "no_key"|"failed", "detail": str, "mailto": url, "text": str, "address": str}
+                                                                          open the mail link (the report is in it);
+                                                                          ``text`` is the same report for the clipboard
       {"status": "rate_limited", "wait_s": n}                             too soon after the previous report
     """
     endpoint = report_config.FORM_ENDPOINT if endpoint is None else endpoint
@@ -198,13 +215,13 @@ def submit(
     if wait:
         return {"status": "rate_limited", "wait_s": wait}
     limiter.mark()
-    link = mailto_url(address, title, body)
+    extra = {"mailto": mailto_url(address, title, body), "text": report_text(title, body), "address": address}
     if is_placeholder(endpoint):
-        return {"status": "fallback", "reason": "no_key", "detail": "reporting is not configured yet", "mailto": link}
+        return {"status": "fallback", "reason": "no_key", "detail": "reporting is not configured yet", **extra}
     try:
         post_report(endpoint, title, body, reply_to, opener=opener)
     except ReportError as exc:
-        return {"status": "fallback", "reason": "failed", "detail": str(exc), "mailto": link}
+        return {"status": "fallback", "reason": "failed", "detail": str(exc), **extra}
     except Exception as exc:  # never let a surprise in the network stack lose the player's report
-        return {"status": "fallback", "reason": "failed", "detail": f"unexpected error ({type(exc).__name__})", "mailto": link}
+        return {"status": "fallback", "reason": "failed", "detail": f"unexpected error ({type(exc).__name__})", **extra}
     return {"status": "sent"}

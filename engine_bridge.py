@@ -25,8 +25,11 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
+import applog
+import diagnostics
 import engine as eng
 import presets as pr
+import reporting
 
 TELEMETRY_INTERVAL_MS = 33      # ~30 Hz meters and latency readout
 PARAM_FLUSH_INTERVAL_MS = 25    # slider drags are coalesced to at most ~40 snapshot rebuilds per second
@@ -86,10 +89,13 @@ class EngineBridge(QObject):
     profile_changed = pyqtSignal(object)  # {"path": str, "autoloaded": bool}
     hotkeys_changed = pyqtSignal(object)  # {hotkey id: registered}
     notify = pyqtSignal(object)           # {"level": success|info|warning|error, "title": str, "text": str}
+    report_ready = pyqtSignal(object)     # {"diagnostics": str, "wait_s": int, "sending": bool}: the form can be opened
+    report_finished = pyqtSignal(object)  # reporting.submit() result: sent | fallback | rate_limited
 
     # ---- internal (emitted from other threads, delivered on the bridge thread) -------------------------------
     _hotkey_pressed = pyqtSignal(int)
     _path_test_done = pyqtSignal(object)
+    _report_done = pyqtSignal(object)
     _shutdown_requested = pyqtSignal()
 
     def __init__(self) -> None:
@@ -100,6 +106,7 @@ class EngineBridge(QObject):
         self._thread.started.connect(self._initialize)
         self._hotkey_pressed.connect(self._on_hotkey)
         self._path_test_done.connect(self._on_path_test_done)
+        self._report_done.connect(self._on_report_done)
         self._shutdown_requested.connect(self._shutdown)
 
         self.config: eng.AppConfig = eng.AppConfig()
@@ -114,6 +121,8 @@ class EngineBridge(QObject):
         self._profile_path = Path(eng.PROFILE_FILENAME)
         self._profile_autoloaded = False
         self._library = pr.PresetLibrary(self._profile_path.with_name(pr.LIBRARY_FILENAME))  # next to the profile
+        self._report_limiter = reporting.RateLimiter()
+        self._report_sending = False
         self._flush_timer: Optional[QTimer] = None
         self._telemetry_timer: Optional[QTimer] = None
 
@@ -406,6 +415,7 @@ class EngineBridge(QObject):
             return
         if self.engine.is_running:
             self.engine.stop_engine()
+            applog.get_logger().info("Audio engine stopped")
             self.engine_state_changed.emit(self._engine_payload())
             return
 
@@ -420,8 +430,10 @@ class EngineBridge(QObject):
         self._running_block_size = self.config.block_size  # the buffer size only changes at the next start
         self.engine_state_changed.emit(self._engine_payload())
         if not ok:
+            applog.get_logger().warning("Audio engine could not start: %s", self.engine.last_error or self.engine.status_text)
             self._notify("error", "Couldn't start the audio engine", self.engine.last_error or self.engine.status_text)
         else:
+            applog.get_logger().info("Audio engine started: %s", self.engine.status_text)
             self._check_monitor()
 
     @pyqtSlot(bool)
@@ -544,6 +556,7 @@ class EngineBridge(QObject):
             kept = f"A copy was kept as {aside.name}."
         except OSError:
             kept = ""
+        applog.get_logger().warning("Custom presets could not be loaded: %s", self._library.load_error)
         self._notify("warning", "Custom presets could not be loaded", f"{self._library.load_error}. {kept}".strip())
 
     @pyqtSlot(str)
@@ -783,3 +796,66 @@ class EngineBridge(QObject):
         ok, message = self.engine.dsp.onnx_streamer.load_model(path)
         self.onnx_changed.emit(self._onnx_payload(message))
         self._notify("success" if ok else "error", "ONNX Runtime", message)
+
+    # ======================================================================================================
+    # problem reports (Settings > Report a problem)
+    # ======================================================================================================
+
+    def _diagnostics_snapshot(self, qt_versions: str) -> dict:
+        cfg = self.config
+        return {
+            "input": self._label_for("input"),
+            "output": self._label_for("output"),
+            "monitor": self._label_for("monitor"),
+            "sample_rate": cfg.sample_rate,
+            "block_size": self._block_size(),
+            "preset": cfg.active_preset,
+            "flags": self._flags_payload(),
+            "engine": self.engine.read_session_stats() if self.engine else {},
+            "qt_versions": qt_versions,
+        }
+
+    @pyqtSlot(str)
+    def prepare_report(self, qt_versions: str) -> None:
+        """Gathers the diagnostics (the form shows them in full before anything is sent) and opens the form."""
+        text = diagnostics.build_diagnostics(self._diagnostics_snapshot(qt_versions))
+        self.report_ready.emit(
+            {"diagnostics": text, "wait_s": self._report_limiter.wait_seconds(), "sending": self._report_sending}
+        )
+
+    @pyqtSlot(object)
+    def submit_report(self, payload: dict) -> None:
+        """Delivers the report on a worker thread, so the network never makes the UI (or the audio) wait."""
+        if self._report_sending:
+            self._notify("info", "Still sending", "The previous report has not finished yet.")
+            return
+        title = str(payload.get("title", ""))[:200]
+        body = str(payload.get("body", ""))[: reporting.BODY_MAX]
+        reply_to = str(payload.get("reply_to", "")).strip()
+        if reply_to and not reporting.valid_email(reply_to):
+            reply_to = ""
+        self._report_sending = True
+        applog.get_logger().info("Problem report: sending (%d characters)", len(body))
+
+        def worker() -> None:
+            try:
+                result = reporting.submit(title, body, reply_to, self._report_limiter)
+            except Exception as exc:  # the player's report must never be lost to a surprise
+                result = {
+                    "status": "fallback",
+                    "reason": "failed",
+                    "detail": f"unexpected error ({type(exc).__name__})",
+                    "mailto": reporting.mailto_url(reporting.report_config.MAILTO_ADDRESS, title, body),
+                    "text": reporting.report_text(title, body),
+                    "address": reporting.report_config.MAILTO_ADDRESS,
+                }
+            self._report_done.emit(result)
+
+        threading.Thread(target=worker, daemon=True, name="vcomms-report").start()
+
+    @pyqtSlot(object)
+    def _on_report_done(self, result: dict) -> None:
+        self._report_sending = False
+        detail = f" ({result['detail']})" if result.get("detail") else ""
+        applog.get_logger().info("Problem report: %s%s", result.get("status"), detail)
+        self.report_finished.emit(result)

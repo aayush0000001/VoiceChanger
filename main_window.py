@@ -6,11 +6,13 @@ the wiring between the pages and the EngineBridge. All engine traffic goes throu
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QRectF, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
+from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, QRectF, QSettings, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+import qfluentwidgets
 from qfluentwidgets import (
     Action,
     FluentIcon,
@@ -24,11 +26,13 @@ from qfluentwidgets import (
     setThemeColor,
 )
 
+import reporting
+from appinfo import APP_NAME
 from engine_bridge import EngineBridge
 from views import DevicesView, LiveView, SettingsView, VoiceView
+from views.dialogs import ReportDialog
 from views.widgets import Toasts
 
-APP_NAME = "V-COMMS"
 THEME_KEYS = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
 MICA_MIN_BUILD = 22000  # Windows 11
 
@@ -78,6 +82,9 @@ class MainWindow(FluentWindow):
     # window -> bridge (the only way the shell talks to the engine besides the views' own signals)
     engineToggleRequested = pyqtSignal()
     telemetryActive = pyqtSignal(bool)
+    reportPrepareRequested = pyqtSignal(str)    # the Qt / library versions line (the engine side does not know the UI)
+    reportSubmitRequested = pyqtSignal(object)  # {"title", "body", "reply_to"} from the report form
+    errorOccurred = pyqtSignal(str)             # raised by the exception hooks, which can fire on any thread
 
     def __init__(self) -> None:
         settings = QSettings(APP_NAME, APP_NAME)
@@ -97,6 +104,7 @@ class MainWindow(FluentWindow):
         self._first_show = True
         self._theme_key = saved_theme
         self._mica_pref = settings.value("appearance/mica", True, type=bool)
+        self._last_error_toast = 0.0
 
         self.bridge = EngineBridge()
         self.themeListener = SystemThemeListener(self)
@@ -173,6 +181,9 @@ class MainWindow(FluentWindow):
         sv.profileSaveRequested.connect(b.save_profile)
         sv.profileLoadRequested.connect(b.load_profile)
         sv.resetAllRequested.connect(b.reset_all)
+        sv.reportRequested.connect(self.request_report)
+        self.reportPrepareRequested.connect(b.prepare_report)
+        self.reportSubmitRequested.connect(b.submit_report)
         self.telemetryActive.connect(b.set_telemetry_active)
 
         # bridge -> views  (state; delivered on the GUI thread)
@@ -200,6 +211,9 @@ class MainWindow(FluentWindow):
         b.profile_changed.connect(sv.apply_profile)
         b.hotkeys_changed.connect(sv.apply_hotkeys)
         b.notify.connect(self.show_notification)
+        b.report_ready.connect(self.open_report_dialog)
+        b.report_finished.connect(self.on_report_finished)
+        self.errorOccurred.connect(self.on_unhandled_error)
 
         # appearance is the window's own business (no engine involved)
         sv.themeSelected.connect(self.set_theme)
@@ -287,6 +301,68 @@ class MainWindow(FluentWindow):
                 self.tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Warning, 4000)
             return
         self.toasts.show(level, title, text, 8000 if level in ("error", "warning") else 4000)
+
+    # ------------------------------------------------------------------ problem reports
+    def request_report(self) -> None:
+        versions = f"Qt {QT_VERSION_STR}  |  PyQt {PYQT_VERSION_STR}  |  QFluentWidgets {qfluentwidgets.__version__}"
+        self.reportPrepareRequested.emit(versions)
+
+    def open_report_dialog(self, data: dict) -> None:
+        if data["sending"]:
+            self.show_notification({"level": "info", "title": "Still sending", "text": "The previous report has not finished yet."})
+            return
+        if data["wait_s"]:
+            text = f"You can send another report in {data['wait_s']} seconds."
+            self.show_notification({"level": "warning", "title": "Please wait a moment", "text": text})
+            return
+        dialog = ReportDialog(self, data["diagnostics"])
+        dialog.accepted.connect(lambda: self.reportSubmitRequested.emit(dialog.payload()))
+        dialog.finished.connect(dialog.deleteLater)
+        dialog.open()
+
+    def on_report_finished(self, result: dict) -> None:
+        status = result.get("status")
+        if status == "sent":
+            self.show_notification({"level": "success", "title": "Report sent", "text": "Thank you. It reached the developer."})
+        elif status == "rate_limited":
+            text = f"You can send another report in {result.get('wait_s', 60)} seconds."
+            self.show_notification({"level": "warning", "title": "Please wait a moment", "text": text})
+        else:
+            self._report_by_mail(result)
+
+    def _report_by_mail(self, result: dict) -> None:
+        """The form service is not set up or did not answer: the same report goes out through the mail program, or
+        onto the clipboard when there is no address to mail or no mail program."""
+        text, address = result.get("text", ""), result.get("address", "")
+        if result.get("reason") == "no_key":
+            why = "The report service is not set up yet."
+        else:
+            why = f"The report service could not be reached ({result.get('detail', 'unknown error')})."
+        if reporting.is_placeholder_address(address):
+            QApplication.clipboard().setText(text)
+            self.show_notification(
+                {"level": "info", "title": "Report copied", "text": f"{why} It is on your clipboard: paste it into an email or message to the developer."}
+            )
+        elif QDesktopServices.openUrl(QUrl.fromEncoded(result["mailto"].encode("ascii"))):
+            self.show_notification(
+                {"level": "info", "title": "Finish in your mail program", "text": f"{why} Your mail program opened with the report ready to send."}
+            )
+        else:
+            QApplication.clipboard().setText(text)
+            self.show_notification(
+                {"level": "warning", "title": "Couldn't open a mail program", "text": f"The report is on your clipboard: paste it into an email to {address}."}
+            )
+
+    def on_unhandled_error(self, text: str) -> None:
+        """A bug in a slot or a thread: it is already in the log; the player gets one calm message, not a crash."""
+        now = time.monotonic()
+        if now - self._last_error_toast < 5.0:
+            return
+        self._last_error_toast = now
+        short = text if len(text) <= 140 else text[:137] + "..."
+        self.show_notification(
+            {"level": "error", "title": "Something went wrong", "text": f"{short}. It was logged. Settings > Report a problem sends it to the developer."}
+        )
 
     def _on_engine_nav_clicked(self, *_args) -> None:
         self.engineToggleRequested.emit()

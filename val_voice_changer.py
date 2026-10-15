@@ -20,6 +20,8 @@ import ctypes
 import io
 import sys
 
+import applog
+from appinfo import APP_NAME, APP_VERSION
 from engine import *  # noqa: F401,F403  (keeps `import val_voice_changer` exposing the engine API)
 from engine import configure_windows_process_isolation, run_production_self_test
 
@@ -48,6 +50,10 @@ def build_gui():
 
         from main_window import MainWindow, make_app_icon
 
+    # A bug in a slot must not silently end the app (PyQt6 aborts on an unhandled exception): log it, and tell the player
+    applog.setup_logging()
+    applog.install_excepthooks()  # logging only for now; the window adds its toast once it exists
+
     app = QApplication(sys.argv)
     app.setApplicationName("V-COMMS")
     app.setOrganizationName("V-COMMS")
@@ -68,6 +74,8 @@ def build_gui():
 
     window = MainWindow()
     window.setWindowIcon(app_icon)
+    applog.install_excepthooks(on_error=window.errorOccurred.emit)  # any thread; the window shows one calm message
+    applog.get_logger().info("%s %s started", APP_NAME, APP_VERSION)
     app.commitDataRequest.connect(window.on_session_end, Qt.ConnectionType.DirectConnection)  # logoff / shutdown
     app.aboutToQuit.connect(window.shutdown_engine)
     return app, window

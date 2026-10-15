@@ -220,7 +220,7 @@ class ReportDialog(FastMessageBox):
         self.errorLabel.setTextColor(color, color)
 
         column = QVBoxLayout()
-        column.setContentsMargins(0, 0, 0, 0)
+        column.setContentsMargins(0, 0, 14, 0)  # room for the scroll bar, which floats over the right edge
         column.setSpacing(GAP_SM)
         column.addWidget(self.titleLabel)
         column.addWidget(intro)
@@ -306,11 +306,11 @@ class ReportDialog(FastMessageBox):
     def _on_changed(self, *_args) -> None:
         count = len(self.summaryEdit.text())
         self.summaryCount.setText(f"{count}/{reporting.SUMMARY_MAX}")
-        self.preview.setPlainText(f"Subject: {self.title_text()}\n\n{self.body_text()}")
+        self.preview.setPlainText(reporting.report_text(self.title_text(), self.body_text()))
         self.errorLabel.setText("")
 
     def _copy(self) -> None:
-        QApplication.clipboard().setText(f"Subject: {self.title_text()}\n\n{self.body_text()}")
+        QApplication.clipboard().setText(reporting.report_text(self.title_text(), self.body_text()))
         self.errorLabel.setText("")
 
     # ------------------------------------------------------------------ Send

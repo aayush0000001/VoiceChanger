@@ -777,6 +777,10 @@ class AudioEngineManager:
         self.latest_dsp_ms: float = 0.0
         self.peak_dsp_ms: float = 0.0   # slowest block since the last read_telemetry()
         self.xruns: int = 0             # PortAudio under/overflow flags seen by the primary callback
+        # totals since the engine was last started (for problem reports); three plain numbers, written by the callback
+        self._dsp_blocks: int = 0
+        self._dsp_total_ms: float = 0.0
+        self._dsp_worst_ms: float = 0.0
 
     def _set_status(self, text: str) -> None:
         self.status_text = text
@@ -791,6 +795,17 @@ class AudioEngineManager:
             "out_db": self.latest_out_db,
             "dsp_ms": self.latest_dsp_ms,
             "peak_dsp_ms": peak,
+            "xruns": self.xruns,
+        }
+
+    def read_session_stats(self) -> Dict[str, float]:
+        """DSP timing totals since the engine was last started, for the diagnostics of a problem report."""
+        blocks = self._dsp_blocks
+        return {
+            "running": self.is_running,
+            "blocks": blocks,
+            "mean_dsp_ms": self._dsp_total_ms / blocks if blocks else 0.0,
+            "worst_dsp_ms": self._dsp_worst_ms,
             "xruns": self.xruns,
         }
 
@@ -844,6 +859,10 @@ class AudioEngineManager:
             self.latest_dsp_ms = dsp_ms
             if dsp_ms > self.peak_dsp_ms:
                 self.peak_dsp_ms = dsp_ms
+            self._dsp_blocks += 1
+            self._dsp_total_ms += dsp_ms
+            if dsp_ms > self._dsp_worst_ms:
+                self._dsp_worst_ms = dsp_ms
             return
 
         if self.config.bypass_effects:
@@ -867,6 +886,10 @@ class AudioEngineManager:
         self.latest_dsp_ms = dsp_ms
         if dsp_ms > self.peak_dsp_ms:
             self.peak_dsp_ms = dsp_ms
+        self._dsp_blocks += 1
+        self._dsp_total_ms += dsp_ms
+        if dsp_ms > self._dsp_worst_ms:
+            self._dsp_worst_ms = dsp_ms
 
     def _monitor_callback(self, outdata: np.ndarray, frames: int, time_info, status) -> None:
         if not self.config.hear_myself:
@@ -908,6 +931,9 @@ class AudioEngineManager:
 
             self.xruns = 0
             self.peak_dsp_ms = 0.0
+            self._dsp_blocks = 0
+            self._dsp_total_ms = 0.0
+            self._dsp_worst_ms = 0.0
             self.primary_stream = sd.Stream(
                 samplerate=self.config.sample_rate,
                 blocksize=self.config.block_size,

@@ -26,6 +26,7 @@ class SettingsView(PageBase):
     profileSaveRequested = pyqtSignal(str)      # path
     profileLoadRequested = pyqtSignal(str)      # path
     resetAllRequested = pyqtSignal(bool)        # also delete the custom presets? (the window resets the look itself)
+    reportRequested = pyqtSignal()              # open the problem report form (the window builds it)
     quitRequested = pyqtSignal()                # (handled by the window itself)
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -126,6 +127,19 @@ class SettingsView(PageBase):
             self.quitButton,
         )
         self.content.addWidget(self.appCard)
+
+        # ---- support -------------------------------------------------------------------------------------------
+        self.add_section("Support")
+        self.supportCard = GroupCard("Help improve V-COMMS")
+        self.reportButton = PushButton(FluentIcon.FEEDBACK, "Report a problem…")
+        self.reportButton.clicked.connect(self.reportRequested)
+        self.supportCard.add_row(
+            FluentIcon.FEEDBACK,
+            "Report a problem",
+            "A bug, a glitch or an idea. You see exactly what is sent, and nothing leaves your PC until you press Send.",
+            self.reportButton,
+        )
+        self.content.addWidget(self.supportCard)
 
         # ---- about -------------------------------------------------------------------------------------------
         self.add_section("About")
