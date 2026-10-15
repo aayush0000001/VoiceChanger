@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-from appinfo import APP_NAME
 
 # The values RegisterHotKey takes. The Windows key is not offered (Windows keeps most Win+key combinations for itself);
 # MOD_WIN exists so a Win+key press can be recognised and explained.
@@ -342,8 +341,9 @@ def store_path() -> Path:
     """%APPDATA%\\V-COMMS\\hotkeys.json: a per-user setting, so it lives with the user's settings (not with the logs in
     %LOCALAPPDATA%), is writable, and is the same whichever folder the app is started from. The only place this path is
     built."""
-    base = os.environ.get("APPDATA") or str(Path.home())
-    return Path(base) / APP_NAME / STORE_FILENAME
+    import appdata  # the one module that knows the app's folders
+
+    return appdata.roaming_dir(create=False) / STORE_FILENAME
 
 
 def load_store(path: Optional[Path] = None) -> Optional[Dict[str, str]]:
