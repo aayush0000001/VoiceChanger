@@ -29,6 +29,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
+# NumPy and SciPy start a BLAS thread pool per logical CPU and reserve about 60 MB of address space for each: over 700 MB
+# of committed memory on a 12-core PC, for nothing, because the DSP only handles 256-sample vectors, which BLAS never
+# splits across threads. This has to be set before NumPy is imported (a variable the player already set wins).
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
+
 import numpy as np
 from scipy import signal
 
