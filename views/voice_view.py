@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 from qfluentwidgets import Action, FluentIcon, PushButton, RoundMenu
 
@@ -53,6 +53,11 @@ GROUPS = [
 ]
 
 
+ROW_ORDER = [name for _title, specs in GROUPS for name, *_rest in specs]
+ROWS_PER_TICK = 2       # a preset change moves the sliders two at a time, 4 ms apart (about 20 ms in all) ...
+ROW_TICK_MS = 4         # ... so no single stretch of Python painting is long enough to hold up the audio thread
+
+
 class VoiceView(PageBase):
     paramChanged = pyqtSignal(str, float)   # voice parameter name, new value
     resetRequested = pyqtSignal()           # re-apply the active preset
@@ -65,6 +70,11 @@ class VoiceView(PageBase):
         self.rows: Dict[str, SliderRow] = {}
         self._custom_names: List[str] = []
         self._reserved: List[str] = []
+        self._row_queue: List[tuple] = []
+        self._row_timer = QTimer(self)
+        self._row_timer.setSingleShot(True)
+        self._row_timer.setInterval(ROW_TICK_MS)
+        self._row_timer.timeout.connect(self._drain_rows)
 
         self.presetsButton = QuietDropDownButton(FluentIcon.TAG, "Presets")
         menu = RoundMenu(parent=self)
@@ -85,7 +95,7 @@ class VoiceView(PageBase):
             card = Card(title)
             for name, label, lo, hi, scale, unit in specs:
                 row = SliderRow(name, label, lo, hi, scale, unit)
-                row.valueChanged.connect(self.paramChanged)
+                row.valueChanged.connect(self._on_row_changed)
                 self.rows[name] = row
                 card.body.addWidget(row)
             (left if index in (0, 2) else right).layout().addWidget(card)
@@ -140,9 +150,26 @@ class VoiceView(PageBase):
 
     def apply_preset(self, name: str) -> None:
         self._active_name = name
-        self.captionLabel.setText(f"Fine-tune the active preset: {name}. Changes apply instantly.")
+        self.update_when_shown(
+            "preset", lambda: self.captionLabel.setText(f"Fine-tune the active preset: {name}. Changes apply instantly.")
+        )
 
     def apply_params(self, params: dict) -> None:
-        for name, row in self.rows.items():
-            if name in params:
-                row.set_value(float(params[name]))
+        self.update_when_shown("params", lambda: self._queue_rows(params))
+
+    def _queue_rows(self, params: dict) -> None:
+        self._row_queue = [(n, float(params[n])) for n in ROW_ORDER if n in params and self.rows[n].differs(float(params[n]))]
+        self._drain_rows()
+
+    def _drain_rows(self) -> None:
+        for _ in range(ROWS_PER_TICK):
+            if not self._row_queue:
+                return
+            name, value = self._row_queue.pop(0)
+            self.rows[name].set_value(value)
+        if self._row_queue:
+            self._row_timer.start()
+
+    def _on_row_changed(self, name: str, value: float) -> None:
+        self._row_queue = [(n, v) for n, v in self._row_queue if n != name]  # the player's hand wins over a pending update
+        self.paramChanged.emit(name, value)

@@ -176,12 +176,18 @@ class LiveView(PageBase):
 
     def apply_preset(self, name: str) -> None:
         self._active_preset = name
+        self.update_when_shown("preset", self._select_tiles)
+
+    def _select_tiles(self) -> None:
         for key, tile in self._tiles.items():
-            tile.set_selected(key == name)
+            tile.set_selected(key == self._active_preset)
 
     def apply_flags(self, flags: dict) -> None:
-        set_switch(self.muteSwitch, bool(flags["mic_muted"]))
-        set_switch(self.bypassSwitch, bool(flags["bypass_effects"]))
+        def apply() -> None:
+            set_switch(self.muteSwitch, bool(flags["mic_muted"]))
+            set_switch(self.bypassSwitch, bool(flags["bypass_effects"]))
+
+        self.update_when_shown("flags", apply)
 
     def apply_engine_state(self, data: dict) -> None:
         self._state = data["state"]

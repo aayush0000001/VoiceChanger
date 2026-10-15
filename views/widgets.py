@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional
 
 from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QContextMenuEvent, QFont, QFontMetrics, QKeyEvent, QPainter, QPainterPath, QPen
@@ -237,6 +237,7 @@ class PageBase(ScrollArea):
         self.actions = QHBoxLayout()
         self.actions.setSpacing(GAP)
         self.actions.setContentsMargins(0, 0, 0, 0)
+        self._deferred: Dict[str, Callable[[], None]] = {}
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, GAP_SM)
@@ -256,6 +257,28 @@ class PageBase(ScrollArea):
     def finish(self) -> None:
         """Call after the last widget has been added so spare height goes below the content, not between cards."""
         self.content.addStretch(1)
+
+    # ---- state updates that nobody can see are postponed -------------------------------------------------
+    def window_on_screen(self) -> bool:
+        window = self.window()
+        return window.isVisible() and not window.isMinimized()
+
+    def update_when_shown(self, key: str, apply: Callable[[], None]) -> None:
+        """
+        Runs ``apply`` now when the window is on screen. While it is hidden to the tray or minimised (how the app is
+        used in a match) there is nothing to see, so the work is kept, the newest per ``key``, and done when the
+        window comes back. A preset hotkey then costs the GUI almost nothing.
+        """
+        if self.window_on_screen():
+            self._deferred.pop(key, None)
+            apply()
+        else:
+            self._deferred[key] = apply
+
+    def flush_deferred(self) -> None:
+        pending, self._deferred = self._deferred, {}
+        for apply in pending.values():
+            apply()
 
 
 class ReflowGrid(QWidget):
@@ -319,6 +342,7 @@ class Toasts:
 
     TOP = 56      # just below the 48 px title bar
     MARGIN = 16
+    MAX_VISIBLE = 4   # a burst of messages replaces the oldest instead of covering the window
 
     def __init__(self, window: QWidget):
         self._window = window
@@ -330,6 +354,10 @@ class Toasts:
             "error": InfoBarIcon.ERROR,
             "warning": InfoBarIcon.WARNING,
         }.get(level, InfoBarIcon.INFORMATION)
+        while len(self._bars) >= self.MAX_VISIBLE:
+            oldest = self._bars[0]
+            oldest.close()
+            self._forget(oldest)  # does nothing when closing it already removed it
         bar = InfoBar(icon, title, text, Qt.Orientation.Horizontal, True, -1, InfoBarPosition.NONE, self._window)
         bar.setGraphicsEffect(None)  # InfoBar keeps an opacity effect attached, which forces offscreen rendering
         bar.closedSignal.connect(lambda b=bar: self._forget(b))
@@ -649,8 +677,13 @@ class SliderRow(QWidget):
             return f"{int(round(value))} {self.unit}"
         return f"{value:+.1f} {self.unit}" if self._signed else f"{value:.1f} {self.unit}"
 
+    def differs(self, value: float) -> bool:
+        return self.slider.value() != int(round(value * self.scale)) or self.valueLabel.text() != self._format(value)
+
     def set_value(self, value: float) -> None:
-        """Moves the slider to a value the engine reported (does not emit)."""
+        """Moves the slider to a value the engine reported (does not emit). Nothing is touched when it already shows it."""
+        if not self.differs(value):
+            return
         self._silent = True
         try:
             self.slider.setValue(int(round(value * self.scale)))
@@ -821,7 +854,15 @@ class PresetTile(CardWidget):
         if selected == self._selected:
             return
         self._selected = selected
-        self._updateBackgroundColor()
+        # no fade: a preset can change in the middle of a match, and every animation frame is Python painting
+        self.backgroundColorAni.stop()
+        if self.isPressed:
+            color = self._pressedBackgroundColor()
+        elif self.isHover:
+            color = self._hoverBackgroundColor()
+        else:
+            color = self._normalBackgroundColor()
+        self.setBackgroundColor(color)
         self.update()
 
     # selected tiles get an accent wash on top of the normal card fill

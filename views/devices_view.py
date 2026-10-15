@@ -223,12 +223,15 @@ class DevicesView(PageBase):
             self._applying = False
 
     def apply_flags(self, flags: dict) -> None:
-        set_switch(self.hearSwitch, bool(flags["hear_myself"]))
-        self._applying = True
-        try:
-            self.gainSlider.setValue(int(round(flags["monitor_volume"] * 100)))
-        finally:
-            self._applying = False
+        def apply() -> None:
+            set_switch(self.hearSwitch, bool(flags["hear_myself"]))
+            self._applying = True
+            try:
+                self.gainSlider.setValue(int(round(flags["monitor_volume"] * 100)))
+            finally:
+                self._applying = False
+
+        self.update_when_shown("flags", apply)
 
     def apply_engine_state(self, data: dict) -> None:
         self._engine_running = data["state"] in ("running", "starting")

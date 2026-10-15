@@ -304,10 +304,11 @@ class MainWindow(FluentWindow):
     def _sync_telemetry(self, *_args) -> None:
         """The meters only run while the Live page is on screen; a hidden or minimized window, or another page,
         costs the audio engine nothing (hotkeys and audio keep running regardless)."""
-        on_screen = (
-            self.isVisible() and not self.isMinimized() and self.stackedWidget.currentWidget() is self.liveView
-        )
-        self.telemetryActive.emit(on_screen)
+        window_shown = self.isVisible() and not self.isMinimized()
+        if window_shown:  # state changes that arrived while nobody could see them (hotkeys in a match)
+            for page in (self.liveView, self.voiceView, self.devicesView, self.settingsView):
+                page.flush_deferred()
+        self.telemetryActive.emit(window_shown and self.stackedWidget.currentWidget() is self.liveView)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)

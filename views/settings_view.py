@@ -226,7 +226,7 @@ class SettingsView(PageBase):
             )
 
     def apply_flags(self, flags: dict) -> None:
-        set_switch(self.onnxSwitch, bool(flags["enable_onnx"]))
+        self.update_when_shown("flags", lambda: set_switch(self.onnxSwitch, bool(flags["enable_onnx"])))
 
     def apply_onnx(self, data: dict) -> None:
         path = data["path"]
