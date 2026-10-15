@@ -1009,13 +1009,10 @@ class AudioEngineManager:
             in_ch = 1 if in_info["max_input_channels"] >= 1 else in_info["max_input_channels"]
             out_ch = min(2, max(1, out_info["max_output_channels"]))
 
-            # Enable WASAPI auto_convert on Windows so hardware format differences never crash stream init
-            extra_cfg = None
-            if hasattr(sd, "WasapiSettings"):
-                try:
-                    extra_cfg = sd.WasapiSettings(exclusive=False, auto_convert=True)
-                except Exception:
-                    extra_cfg = None
+            # WASAPI shared mode with auto_convert: Windows converts between the engine's 48 kHz and whatever rate the
+            # device runs at, so players never have to set 48 kHz by hand (measured: no added delay). Only for WASAPI
+            # devices; an MME or DirectSound device refuses WASAPI settings and does its own conversion.
+            extra_cfg = (wasapi_shared_settings(in_idx), wasapi_shared_settings(out_idx))
 
             # A numeric suggested latency really enlarges WASAPI's shared-mode buffer; "high" does not (it gives the
             # same buffer as "low"): more headroom against a busy PC for a few tens of ms more delay.
@@ -1058,7 +1055,7 @@ class AudioEngineManager:
                     channels=mon_ch,
                     dtype="float32",
                     latency=latency,
-                    extra_settings=extra_cfg,
+                    extra_settings=wasapi_shared_settings(mon_idx),
                     callback=self._monitor_callback,
                 )
                 self.monitor_stream.start()
@@ -1089,6 +1086,17 @@ class AudioEngineManager:
         self.latest_in_db = -80.0
         self.latest_out_db = -80.0
         self._set_status("STOPPED")
+
+
+def wasapi_shared_settings(dev_idx: int):
+    """WasapiSettings(shared, auto_convert) for a WASAPI device, None for any other host API."""
+    if not hasattr(sd, "WasapiSettings"):
+        return None
+    try:
+        api_name = sd.query_hostapis(sd.query_devices(dev_idx)["hostapi"])["name"]
+    except Exception:
+        return None
+    return sd.WasapiSettings(exclusive=False, auto_convert=True) if "WASAPI" in api_name.upper() else None
 
 
 def run_audio_path_test(

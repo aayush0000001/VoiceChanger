@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
+import appdata
 import applog
 import diagnostics
 import engine as eng
@@ -143,7 +144,7 @@ class EngineBridge(QObject):
         self._pending: Dict[str, float] = {}
         self._path_test_running = False
         self._running_block_size = self.config.block_size
-        self._profile_path = Path(eng.PROFILE_FILENAME)
+        self._profile_path = appdata.profile_path()  # %APPDATA%\V-COMMS; presets sit next to it
         self._profile_autoloaded = False
         self._library = pr.PresetLibrary(self._profile_path.with_name(pr.LIBRARY_FILENAME))  # next to the profile
         self._report_limiter = reporting.RateLimiter()

@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, QRectF, QSettings, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, QRectF, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 import qfluentwidgets
@@ -28,6 +28,7 @@ from qfluentwidgets import (
     setThemeColor,
 )
 
+import appdata
 import reporting
 from appinfo import APP_NAME
 from engine_bridge import EngineBridge
@@ -107,7 +108,7 @@ class MainWindow(FluentWindow):
     _trim_timer = None
 
     def __init__(self) -> None:
-        settings = QSettings(APP_NAME, APP_NAME)
+        settings = appdata.qsettings()  # %APPDATA%\V-COMMS\settings.ini
         saved_theme = str(settings.value("appearance/theme", "auto"))
         if saved_theme not in THEME_KEYS:
             saved_theme = "auto"

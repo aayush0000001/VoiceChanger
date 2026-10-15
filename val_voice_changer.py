@@ -26,7 +26,7 @@ from engine import *  # noqa: F401,F403  (keeps `import val_voice_changer` expos
 from engine import configure_windows_process_isolation, run_production_self_test
 
 
-def build_gui():
+def build_gui(background: bool = False):
     """Creates the QApplication and the main window (not shown yet). Returns ``(app, window)``."""
     # When running as a standalone frozen executable (PyInstaller), Windows already associates
     # the process and taskbar icon directly with V-COMMS.exe. Calling SetCurrentProcessExplicitAppUserModelID
@@ -75,15 +75,19 @@ def build_gui():
     window = MainWindow()
     window.setWindowIcon(app_icon)
     applog.install_excepthooks(on_error=window.errorOccurred.emit)  # any thread; the window shows one calm message
+    import winapp_ui
+
+    winapp_ui.attach(app, window, background)  # single instance, Start with Windows, data folder, first-run setup
     applog.get_logger().info("%s %s started", APP_NAME, APP_VERSION)
     app.commitDataRequest.connect(window.on_session_end, Qt.ConnectionType.DirectConnection)  # logoff / shutdown
     app.aboutToQuit.connect(window.shutdown_engine)
     return app, window
 
 
-def run_gui() -> int:
-    app, window = build_gui()
-    window.show()
+def run_gui(background: bool = False) -> int:
+    app, window = build_gui(background)
+    if not background:  # started at sign-in: stay in the tray
+        window.show()
 
     # Explicitly set the native Win32 window icon handles on the HWND to ensure
     # the taskbar button displays the icon under all Windows 11 shell states.
@@ -120,13 +124,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="Run automated DSP verification, memory audit, and latency benchmark.",
     )
+    parser.add_argument("--background", action="store_true", help="Start in the system tray.")
     args = parser.parse_args(argv)
 
     configure_windows_process_isolation()
 
     if args.self_test:
         return run_production_self_test()
-    return run_gui()
+    return run_gui(args.background)
 
 
 if __name__ == "__main__":
