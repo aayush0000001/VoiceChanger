@@ -156,7 +156,63 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         drive_db=0.0,
         output_gain_db=0.5,
     ),
+    # Female voices. Appended after the four above so saved profiles and the Ctrl+Alt+F1..F4 hotkeys keep pointing at
+    # the same presets. The pitch shifter moves formants by the same ratio as pitch, so each one trades a female pitch
+    # against formants that sit higher than a real woman's (measured: 1.3x to 1.8x a male voice, against about 1.25x).
+    "Female Natural (Clear)": VoiceParameters(
+        name="Female Natural (Clear)",
+        pitch_semitones=6.0,
+        formant_semitones=1.5,
+        gate_threshold_db=-48.0,
+        hpf_cutoff_hz=120.0,
+        lpf_cutoff_hz=10000.0,
+        ring_mod_hz=0.0,
+        ring_mod_mix=0.0,
+        reverb_mix=0.0,
+        drive_db=0.0,
+        output_gain_db=1.0,
+    ),
+    "Female Bright (Young)": VoiceParameters(
+        name="Female Bright (Young)",
+        pitch_semitones=8.0,
+        formant_semitones=3.0,
+        gate_threshold_db=-48.0,
+        hpf_cutoff_hz=150.0,
+        lpf_cutoff_hz=13000.0,
+        ring_mod_hz=0.0,
+        ring_mod_mix=0.0,
+        reverb_mix=0.0,
+        drive_db=0.0,
+        output_gain_db=0.5,
+    ),
+    "Female Husky (Low)": VoiceParameters(
+        name="Female Husky (Low)",
+        pitch_semitones=4.5,
+        formant_semitones=-1.5,
+        gate_threshold_db=-48.0,
+        hpf_cutoff_hz=100.0,
+        lpf_cutoff_hz=6500.0,
+        ring_mod_hz=0.0,
+        ring_mod_mix=0.0,
+        reverb_mix=0.06,
+        drive_db=3.0,
+        output_gain_db=1.0,
+    ),
+    "Female Cute (Airy)": VoiceParameters(
+        name="Female Cute (Airy)",
+        pitch_semitones=10.0,
+        formant_semitones=4.5,
+        gate_threshold_db=-48.0,
+        hpf_cutoff_hz=180.0,
+        lpf_cutoff_hz=15000.0,
+        ring_mod_hz=0.0,
+        ring_mod_mix=0.0,
+        reverb_mix=0.05,
+        drive_db=0.0,
+        output_gain_db=0.0,
+    ),
 }
+HOTKEY_PRESET_COUNT = 4  # the first four presets have Ctrl+Alt+F1..F4; the rest are picked from the window
 
 
 @dataclass

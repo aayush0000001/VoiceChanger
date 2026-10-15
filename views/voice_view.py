@@ -11,7 +11,7 @@ from qfluentwidgets import Action, FluentIcon, PushButton, RoundMenu
 import preset_names
 from styles import GAP
 from .dialogs import NameDialog, ask_preset_export_path, ask_preset_import_path
-from .widgets import Card, PageBase, QuietDropDownButton, ReflowGrid, SliderRow
+from .widgets import Card, PageBase, QuietDropDownButton, ReflowGrid, SliderRow, icon_by_name
 
 # name, title, min, max, scale (slider steps per unit), unit
 GROUPS = [
@@ -61,6 +61,7 @@ ROW_TICK_MS = 4         # ... so no single stretch of Python painting is long en
 class VoiceView(PageBase):
     paramChanged = pyqtSignal(str, float)   # voice parameter name, new value
     resetRequested = pyqtSignal()           # re-apply the active preset
+    presetRequested = pyqtSignal(str)       # switch to this built-in preset
     presetSaveRequested = pyqtSignal(str)   # save the current settings under this name
     presetImportRequested = pyqtSignal(str)     # path of a preset file
     exportCurrentRequested = pyqtSignal(str)    # path to write the current settings to
@@ -78,6 +79,14 @@ class VoiceView(PageBase):
 
         self.presetsButton = QuietDropDownButton(FluentIcon.TAG, "Presets")
         menu = RoundMenu(parent=self)
+        # the built-in voices, filled in by set_presets
+        self.tacticalMenu = RoundMenu("Tactical voices", self)
+        self.tacticalMenu.setIcon(FluentIcon.GAME)
+        self.femaleMenu = RoundMenu("Female voices", self)
+        self.femaleMenu.setIcon(FluentIcon.PEOPLE)
+        menu.addMenu(self.tacticalMenu)
+        menu.addMenu(self.femaleMenu)
+        menu.addSeparator()
         menu.addAction(Action(FluentIcon.SAVE, "Save as preset…", triggered=self._save_as_preset))
         menu.addAction(Action(FluentIcon.DOWNLOAD, "Import preset…", triggered=self._import_preset))
         menu.addSeparator()
@@ -147,6 +156,16 @@ class VoiceView(PageBase):
 
     def set_presets(self, data: dict) -> None:
         self._custom_names = list(data["custom_names"])
+        for sub in (self.tacticalMenu, self.femaleMenu):
+            sub.clear()
+        for p in data["presets"]:
+            sub = {"tactical": self.tacticalMenu, "female": self.femaleMenu}.get(p.get("group"))
+            if sub is None:
+                continue
+            label = f"{p['title']}  ·  {p['tag']}" if p["tag"] else p["title"]
+            sub.addAction(
+                Action(icon_by_name(p["icon"]), label, triggered=lambda _=False, k=p["key"]: self.presetRequested.emit(k))
+            )
 
     def apply_preset(self, name: str) -> None:
         self._active_name = name

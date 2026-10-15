@@ -50,7 +50,12 @@ PRESET_META = {
     "Tactical Comms (Radio)": ("Tight 420 Hz to 2.9 kHz band-pass with an overdriven comms crunch.", "MEGAPHONE"),
     "Cybernetic Agent (KAY/O)": ("Phase-continuous 58 Hz ring modulator with a shifted vocal tract.", "ROBOT"),
     "Pitch Clean (Up / Helium-Lite)": ("Clean upward pitch and formant shift. No grit.", "UP"),
+    "Female Natural (Clear)": ("Everyday female pitch with a clean, slightly warm top.", "PEOPLE"),
+    "Female Bright (Young)": ("Higher and brighter, with a lifted vocal tract.", "BRIGHTNESS"),
+    "Female Husky (Low)": ("Low alto with a dark, breathy grain. Closest to real female formants.", "MICROPHONE"),
+    "Female Cute (Airy)": ("High, light and airy, with a touch of room.", "HEART"),
 }
+FEMALE_PRESETS = tuple(name for name in eng.TACTICAL_PRESETS if name.startswith("Female "))
 
 # The Settings rows of the two switch hotkeys (the four preset hotkeys are described by the presets they select).
 SWITCH_HOTKEYS = {
@@ -236,23 +241,25 @@ class EngineBridge(QObject):
         return action, (hk.combo_text(serial) if serial else "No hotkey")
 
     def _preset_items(self) -> List[dict]:
-        """Tile data: the built-ins (their hotkeys are the ones set in Settings, Ctrl+Alt+F1..F4 at first), then the
-        player's own presets in the order they made them."""
+        """Tile data: the built-ins (the first four carry the hotkeys set in Settings, Ctrl+Alt+F1..F4 at first, then
+        the female voices), then the player's own presets in the order they made them."""
         items = []
         for n, name in enumerate(eng.TACTICAL_PRESETS, start=1):
             title, tag = _split_preset_name(name)
             blurb, icon = PRESET_META.get(name, ("", "MICROPHONE"))
             action, chip = self._preset_hotkey(n)
+            female = name in FEMALE_PRESETS
             items.append(
                 {
                     "key": name,
                     "title": title,
                     "tag": tag,
-                    "hotkey": chip,
+                    "hotkey": chip if action else ("Female" if female else ""),
                     "hotkey_action": action,
                     "blurb": blurb,
                     "icon": icon,
                     "custom": False,
+                    "group": "female" if female else "tactical",
                 }
             )
         for name, params in self._library.items.items():
@@ -266,6 +273,7 @@ class EngineBridge(QObject):
                     "blurb": _summary(params),
                     "icon": "TAG",
                     "custom": True,
+                    "group": "custom",
                 }
             )
         return items

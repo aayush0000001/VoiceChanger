@@ -192,6 +192,7 @@ class MainWindow(FluentWindow):
         lv.flagToggled.connect(b.set_flag)
         vv.paramChanged.connect(b.set_param)
         vv.resetRequested.connect(b.reset_to_preset)
+        vv.presetRequested.connect(b.apply_preset)
         vv.presetSaveRequested.connect(b.save_preset)
         vv.presetImportRequested.connect(b.import_preset)
         vv.exportCurrentRequested.connect(b.export_current)

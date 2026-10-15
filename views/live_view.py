@@ -80,6 +80,11 @@ class LiveView(PageBase):
         self.content.addLayout(section)
         self.tileGrid = ReflowGrid(min_item_width=176, max_columns=4)
         self.content.addWidget(self.tileGrid)
+        self.femaleTitle = StrongBodyLabel("Female voices")
+        self.femaleTitle.setContentsMargins(2, GAP_SM, 0, 0)
+        self.content.addWidget(self.femaleTitle)
+        self.femaleGrid = ReflowGrid(min_item_width=176, max_columns=4)
+        self.content.addWidget(self.femaleGrid)
 
         # quick controls + levels side by side (stacked on narrow windows)
         row = ReflowGrid(min_item_width=380, max_columns=2)
@@ -134,9 +139,10 @@ class LiveView(PageBase):
         self._reserved = list(data["preset_rules"]["reserved"])
 
     def set_presets(self, data: dict) -> None:
-        """Built-in tiles first (Ctrl+Alt+F1..F4), then the player's own."""
+        """Built-in tiles first (Ctrl+Alt+F1..F4), then the player's own; the female voices get a section of their own."""
         self._custom_names = list(data["custom_names"])
         self.tileGrid.clear()
+        self.femaleGrid.clear()
         self._tiles.clear()
         self._tile_actions.clear()
         for p in data["presets"]:
@@ -153,7 +159,10 @@ class LiveView(PageBase):
                 tile.exportRequested.connect(self._export_preset)
                 tile.deleteRequested.connect(self._delete_preset)
             self._tiles[p["key"]] = tile
-            self.tileGrid.add(tile)
+            (self.femaleGrid if p.get("group") == "female" else self.tileGrid).add(tile)
+        has_female = any(p.get("group") == "female" for p in data["presets"])
+        self.femaleTitle.setVisible(has_female)
+        self.femaleGrid.setVisible(has_female)
         self.apply_preset(self._active_preset)
 
     def apply_hotkeys(self, data: dict) -> None:
