@@ -110,7 +110,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Deep Shadow (Omen)",
         pitch_semitones=-4.5,
         formant_semitones=-2.8,
-        gate_threshold_db=-46.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=75.0,
         lpf_cutoff_hz=6800.0,
         ring_mod_hz=36.0,
@@ -123,7 +123,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Tactical Comms (Radio)",
         pitch_semitones=0.0,
         formant_semitones=0.5,
-        gate_threshold_db=-42.0,
+        gate_threshold_db=-52.0,
         hpf_cutoff_hz=420.0,
         lpf_cutoff_hz=2900.0,
         ring_mod_hz=0.0,
@@ -136,7 +136,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Cybernetic Agent (KAY/O)",
         pitch_semitones=-2.0,
         formant_semitones=-1.5,
-        gate_threshold_db=-45.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=90.0,
         lpf_cutoff_hz=9500.0,
         ring_mod_hz=58.0,
@@ -149,7 +149,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Pitch Clean (Up / Helium-Lite)",
         pitch_semitones=3.5,
         formant_semitones=1.8,
-        gate_threshold_db=-48.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=95.0,
         lpf_cutoff_hz=16000.0,
         ring_mod_hz=0.0,
@@ -165,7 +165,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Female Natural (Clear)",
         pitch_semitones=6.0,
         formant_semitones=1.5,
-        gate_threshold_db=-48.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=120.0,
         lpf_cutoff_hz=10000.0,
         ring_mod_hz=0.0,
@@ -178,7 +178,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Female Bright (Young)",
         pitch_semitones=8.0,
         formant_semitones=3.0,
-        gate_threshold_db=-48.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=150.0,
         lpf_cutoff_hz=13000.0,
         ring_mod_hz=0.0,
@@ -191,7 +191,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Female Husky (Low)",
         pitch_semitones=4.5,
         formant_semitones=-1.5,
-        gate_threshold_db=-48.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=100.0,
         lpf_cutoff_hz=6500.0,
         ring_mod_hz=0.0,
@@ -204,7 +204,7 @@ TACTICAL_PRESETS: Dict[str, VoiceParameters] = {
         name="Female Cute (Airy)",
         pitch_semitones=10.0,
         formant_semitones=4.5,
-        gate_threshold_db=-48.0,
+        gate_threshold_db=-54.0,
         hpf_cutoff_hz=180.0,
         lpf_cutoff_hz=15000.0,
         ring_mod_hz=0.0,
@@ -891,6 +891,10 @@ class AudioEngineManager:
         self._dsp_total_ms: float = 0.0
         self._dsp_worst_ms: float = 0.0
         self.stream_latency_ms: Tuple[float, float] = (0.0, 0.0)  # driver buffering reported by PortAudio when it started
+        self._current_in_idx: Optional[int] = None
+        self._current_out_idx: Optional[int] = None
+        self._current_mon_idx: Optional[int] = None
+        self._scratch_mono = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
 
     def _set_status(self, text: str) -> None:
         self.status_text = text
@@ -940,8 +944,20 @@ class AudioEngineManager:
 
         for pass_num in (1, 2):
             for idx, dev in enumerate(devices):
-                if pass_num == 1 and preferred_api_idx is not None and dev["hostapi"] != preferred_api_idx:
+                if preferred_api_idx is not None and dev["hostapi"] != preferred_api_idx:
                     continue
+                name = dev["name"].strip()
+                api_name = hostapis[dev["hostapi"]]["name"]
+                label = f"{name} [{api_name}]"
+                if dev["max_input_channels"] > 0 and name not in seen_in:
+                    inputs.append((idx, label))
+                    seen_in.add(name)
+                if dev["max_output_channels"] > 0 and name not in seen_out:
+                    outputs.append((idx, label))
+                    seen_out.add(name)
+
+        if not inputs and not outputs:
+            for idx, dev in enumerate(devices):
                 name = dev["name"].strip()
                 api_name = hostapis[dev["hostapi"]]["name"]
                 label = f"{name} [{api_name}]"
@@ -962,7 +978,24 @@ class AudioEngineManager:
         if last and t0 - last > self.stall_threshold_s:
             self.stalls += 1
 
-        mono_in = indata[:, 0] if indata.ndim > 1 else indata
+        if indata.ndim > 1:
+            if indata.shape[1] == 1:
+                mono_in = indata[:, 0]
+            else:
+                ch0 = indata[:, 0]
+                ch1 = indata[:, 1]
+                e0 = float(np.dot(ch0, ch0))
+                e1 = float(np.dot(ch1, ch1))
+                if e0 > 1e-7 and e1 < 1e-8:
+                    mono_in = ch0
+                elif e1 > 1e-7 and e0 < 1e-8:
+                    mono_in = ch1
+                else:
+                    mono_in = self._scratch_mono[:frames]
+                    np.add(ch0, ch1, out=mono_in)
+                    np.multiply(mono_in, 0.5, out=mono_in)
+        else:
+            mono_in = indata
         in_rms = float(np.sqrt(np.dot(mono_in, mono_in) / float(max(frames, 1)) + 1e-12))
         self.latest_in_db = max(-80.0, 20.0 * np.log10(in_rms))
 
@@ -1024,6 +1057,9 @@ class AudioEngineManager:
             return False
 
         self.stop_engine()
+        self._current_in_idx = in_idx
+        self._current_out_idx = out_idx
+        self._current_mon_idx = mon_idx
         try:
             self.dsp = RealTimeDSPChain(self.config.sample_rate)
             self.dsp.update_parameters(self.config.current_params)
@@ -1032,7 +1068,7 @@ class AudioEngineManager:
 
             in_info = sd.query_devices(in_idx)
             out_info = sd.query_devices(out_idx)
-            in_ch = 1 if in_info["max_input_channels"] >= 1 else in_info["max_input_channels"]
+            in_ch = min(2, max(1, in_info["max_input_channels"]))
             out_ch = min(2, max(1, out_info["max_output_channels"]))
 
             # WASAPI shared mode with auto_convert: Windows converts between the engine's 48 kHz and whatever rate the
@@ -1071,26 +1107,15 @@ class AudioEngineManager:
                 # callbacks also holds one ordinary period, so 90% of the buffer is where the alarm sounds
                 self.stall_threshold_s = max(0.025, 0.9 * self.stream_latency_ms[1] / 1000.0)
 
-            if mon_idx is not None and mon_idx != out_idx:
-                mon_info = sd.query_devices(mon_idx)
-                mon_ch = min(2, max(1, mon_info["max_output_channels"]))
-                self.monitor_stream = sd.OutputStream(
-                    samplerate=self.config.sample_rate,
-                    blocksize=self.config.block_size,
-                    device=mon_idx,
-                    channels=mon_ch,
-                    dtype="float32",
-                    latency=latency,
-                    extra_settings=wasapi_shared_settings(mon_idx),
-                    callback=self._monitor_callback,
-                )
-                self.monitor_stream.start()
-
             self.is_running = True
             block_ms = (self.config.block_size / self.config.sample_rate) * 1000.0
             self._set_status(
                 f"ACTIVE | {self.config.sample_rate}Hz | {self.config.block_size} spl ({block_ms:.1f}ms buf)"
             )
+
+            if self.config.hear_myself and mon_idx is not None and mon_idx != out_idx:
+                self.start_monitor(mon_idx)
+
             return True
         except Exception as exc:
             self.stop_engine()
@@ -1098,18 +1123,52 @@ class AudioEngineManager:
             self._set_status(f"Audio Stream Error: {exc}")
             return False
 
+    def start_monitor(self, mon_idx: Optional[int]) -> bool:
+        self.stop_monitor()
+        if mon_idx is None or mon_idx == self._current_out_idx or not self.is_running:
+            return False
+        try:
+            latency = STABILITY_LATENCY_S if self.config.stability_buffer else "low"
+            mon_info = sd.query_devices(mon_idx)
+            mon_ch = min(2, max(1, mon_info["max_output_channels"]))
+            self._current_mon_idx = mon_idx
+            self.monitor_ring.reset()
+            self.monitor_stream = sd.OutputStream(
+                samplerate=self.config.sample_rate,
+                blocksize=self.config.block_size,
+                device=mon_idx,
+                channels=mon_ch,
+                dtype="float32",
+                latency=latency,
+                extra_settings=wasapi_shared_settings(mon_idx),
+                callback=self._monitor_callback,
+            )
+            self.monitor_stream.start()
+            return True
+        except Exception as exc:
+            self.monitor_stream = None
+            return False
+
+    def stop_monitor(self) -> None:
+        if self.monitor_stream is not None:
+            try:
+                self.monitor_stream.stop()
+                self.monitor_stream.close()
+            except Exception:
+                pass
+            self.monitor_stream = None
+        self.monitor_ring.reset()
+
     def stop_engine(self) -> None:
         self.is_running = False
-        for stream in (self.primary_stream, self.monitor_stream):
-            if stream is not None:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
-        self.primary_stream = None
-        self.monitor_stream = None
-        self.monitor_ring.reset()
+        self.stop_monitor()
+        if self.primary_stream is not None:
+            try:
+                self.primary_stream.stop()
+                self.primary_stream.close()
+            except Exception:
+                pass
+            self.primary_stream = None
         self.latest_in_db = -80.0
         self.latest_out_db = -80.0
         self._set_status("STOPPED")
@@ -1560,6 +1619,14 @@ def pick_device_targets(
         if config.monitor_device_name and config.monitor_device_name in label:
             mon_target = i
 
+    # If no monitor was explicitly saved and cable is selected as output,
+    # default monitor to a different physical output (e.g. Headphones/Speakers)
+    if not config.monitor_device_name and mon_target == out_target:
+        for i, (_, label) in enumerate(outputs):
+            if i != out_target:
+                mon_target = i
+                break
+
     return in_target, out_target, mon_target
 
 
@@ -1606,16 +1673,25 @@ def run_production_self_test() -> int:
         np.float32
     )
 
+    # Verify zero heap allocation during block processing
     tracemalloc.start()
-    timings_ms: List[float] = []
+    for preset_name, preset_params in TACTICAL_PRESETS.items():
+        dsp.update_parameters(preset_params)
+        for _ in range(20):
+            _ = dsp.process_block(synth_voice, use_onnx=False)
+    snap_before = tracemalloc.take_snapshot()
+    for _ in range(50):
+        _ = dsp.process_block(synth_voice, use_onnx=False)
+    snap_after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
 
+    timings_ms: List[float] = []
     for preset_name, preset_params in TACTICAL_PRESETS.items():
         dsp.update_parameters(preset_params)
         # Warm up caches
-        for _ in range(10):
+        for _ in range(20):
             _ = dsp.process_block(synth_voice, use_onnx=False)
 
-        snap_before = tracemalloc.take_snapshot()
         for _ in range(250):
             t0 = time.perf_counter()
             out = dsp.process_block(synth_voice, use_onnx=False)
@@ -1624,10 +1700,7 @@ def run_production_self_test() -> int:
             assert out.dtype == np.float32, f"{preset_name} output dtype is not float32!"
             assert np.all(np.isfinite(out)), f"{preset_name} produced NaN/Inf!"
             assert float(np.max(np.abs(out))) <= 0.90, f"{preset_name} exceeded -1.0 dBFS limiter ceiling!"
-        snap_after = tracemalloc.take_snapshot()
         print(f"[PASS] Preset '{preset_name}': 250 blocks clean | Max Peak: {np.max(np.abs(out)):.3f}")
-
-    tracemalloc.stop()
 
     arr_ms = np.array(timings_ms)
     p50 = float(np.percentile(arr_ms, 50))

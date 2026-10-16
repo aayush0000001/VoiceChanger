@@ -110,6 +110,7 @@ class DevicesView(PageBase):
         self.hearSwitch.checkedChanged.connect(lambda checked: self.flagToggled.emit("hear_myself", checked))
         self.gainSlider = Slider(Qt.Orientation.Horizontal)
         self.gainSlider.setRange(0, 100)
+        self.gainSlider.setValue(75)
         self.gainSlider.setFixedWidth(200)
         self.gainSlider.setAccessibleName("Monitor gain")
         self.gainLabel = muted(CaptionLabel("75%"))

@@ -460,6 +460,18 @@ class EngineBridge(QObject):
             return
         self._selected[role] = device_index
         setattr(self.config, f"{role}_device_name", self._label_for(role))
+        if self.engine and self.engine.is_running:
+            if role == "monitor":
+                if self.config.hear_myself:
+                    self.engine.start_monitor(device_index)
+            else:
+                in_idx, out_idx = self._selected["input"], self._selected["output"]
+                if in_idx is not None and out_idx is not None:
+                    self._sync_device_names()
+                    ok = self.engine.start_engine(in_idx, out_idx, self._selected["monitor"])
+                    self.engine_state_changed.emit(self._engine_payload())
+                    if not ok:
+                        self._notify("error", "Couldn't switch audio device", self.engine.last_error or self.engine.status_text)
 
     @pyqtSlot(int)
     def set_block_size(self, samples: int) -> None:
@@ -596,9 +608,24 @@ class EngineBridge(QObject):
         if name == "lite_mode":
             self._apply_lite()
         self.flags_changed.emit(self._flags_payload())
-        if name == "hear_myself" and value:
-            self._check_monitor()
-        elif name == "stability_buffer" and self.engine.is_running:
+        if name == "hear_myself":
+            if self.engine and self.engine.is_running:
+                if value:
+                    mon_idx = self._selected.get("monitor")
+                    out_idx = self._selected.get("output")
+                    if mon_idx is None or mon_idx == out_idx:
+                        self._notify(
+                            "warning",
+                            "Hear Myself needs another device",
+                            "Pick headphones that differ from the Virtual Cable Output.",
+                        )
+                    else:
+                        ok = self.engine.start_monitor(mon_idx)
+                        if not ok:
+                            self._notify("warning", "Couldn't open monitor", "Check that your headphones are plugged in and ready.")
+                else:
+                    self.engine.stop_monitor()
+        elif name == "stability_buffer" and self.engine and self.engine.is_running:
             self._notify("info", "Applies at the next start", "Restart the audio engine to use the new buffer.")
 
     def _check_monitor(self) -> None:
@@ -609,10 +636,12 @@ class EngineBridge(QObject):
             self._notify(
                 "warning",
                 "Hear Myself needs another device",
-                "Pick headphones that differ from the Virtual Cable Output, then restart the audio engine.",
+                "Pick headphones that differ from the Virtual Cable Output.",
             )
-        elif self.engine.is_running and self.engine.monitor_stream is None:
-            self._notify("warning", "No monitor stream is open", "Restart the audio engine to open the headphone monitor.")
+        elif self.engine and self.engine.is_running and self.engine.monitor_stream is None:
+            ok = self.engine.start_monitor(self._selected["monitor"])
+            if not ok:
+                self._notify("warning", "Couldn't open monitor", "Check that your headphones are plugged in and ready.")
 
     @pyqtSlot(float)
     def set_monitor_volume(self, volume: float) -> None:
