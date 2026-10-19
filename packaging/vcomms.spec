@@ -35,7 +35,9 @@ QT_BINDINGS = {"PySide6", "PyQt6", "PySide2", "PyQt5"}
 qt_binding = "PyQt6" if uses_pyqt6 else "PySide6"
 
 hiddenimports = ["PyQt6.QtNetwork"]
-datas = [(str(ROOT / "app_icon.ico"), ".")]  # main_window.make_app_icon looks for it next to the code
+datas = [(str(ROOT / "app_icon.ico"), ".")]
+if (ROOT / "models" / "vec-768-layer-12.onnx").is_file():
+    datas += [(str(ROOT / "models" / "vec-768-layer-12.onnx"), "models")]
 if uses_fluent:
     # qfluentwidgets and its frameless-window dependency load parts of
     # themselves dynamically, so collect them whole.
