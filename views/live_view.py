@@ -190,8 +190,13 @@ class LiveView(PageBase):
 
     def apply_onnx(self, data: dict) -> None:
         path = data.get("path", "")
+        msg = data.get("message", "")
         if path:
-            self.modelRow.contentLabel.setText(Path(path).name)
+            name = Path(path).name
+            if msg and "Failed" not in msg and "error" not in msg.lower():
+                self.modelRow.contentLabel.setText(f"{name} ({msg})")
+            else:
+                self.modelRow.contentLabel.setText(name)
         else:
             self.modelRow.contentLabel.setText("No model selected.")
         onnx_on = bool(data.get("enabled", False))

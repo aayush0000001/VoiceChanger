@@ -607,6 +607,24 @@ class EngineBridge(QObject):
         setattr(self.config, name, bool(value))
         if name == "lite_mode":
             self._apply_lite()
+        elif name == "enable_onnx":
+            if value:
+                if self.engine and self.engine.dsp and not self.engine.dsp.onnx_streamer.active:
+                    if self.config.onnx_model_path:
+                        ok, msg = self.engine.dsp.onnx_streamer.load_model(self.config.onnx_model_path)
+                        if not ok:
+                            setattr(self.config, "enable_onnx", False)
+                            self._notify("error", "Model Load Failed", msg)
+                            self.flags_changed.emit(self._flags_payload())
+                            self.onnx_changed.emit(self._onnx_payload(msg))
+                            return
+                    else:
+                        setattr(self.config, "enable_onnx", False)
+                        self._notify("warning", "No Model Selected", "Select an .onnx voice model first.")
+                        self.flags_changed.emit(self._flags_payload())
+                        self.onnx_changed.emit(self._onnx_payload("No model selected."))
+                        return
+            self.onnx_changed.emit(self._onnx_payload())
         self.flags_changed.emit(self._flags_payload())
         if name == "hear_myself":
             if self.engine and self.engine.is_running:
@@ -1068,10 +1086,17 @@ class EngineBridge(QObject):
 
     @pyqtSlot(str)
     def load_onnx_model(self, path: str) -> None:
+        if not path:
+            return
         self.config.onnx_model_path = path
         ok, message = self.engine.dsp.onnx_streamer.load_model(path)
+        if ok:
+            self.config.enable_onnx = True
+        else:
+            self.config.enable_onnx = False
+        self.flags_changed.emit(self._flags_payload())
         self.onnx_changed.emit(self._onnx_payload(message))
-        self._notify("success" if ok else "error", "ONNX Runtime", message)
+        self._notify("success" if ok else "error", "ONNX Voice Model", message)
 
     # ======================================================================================================
     # problem reports (Settings > Report a problem)

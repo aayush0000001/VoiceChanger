@@ -625,12 +625,21 @@ class ONNXVoiceStreamer:
                 self.is_rvc = True
                 # Look for HuBERT ContentVec feature extractor in models/ or model directory
                 model_dir = os.path.dirname(os.path.abspath(model_path))
+                appdata_models = os.path.join(os.environ.get("APPDATA", ""), "V-COMMS", "models")
+                localapp_models = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "V-COMMS", "models")
+                script_models = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+                exe_models = os.path.join(os.path.dirname(sys.executable), "models")
                 candidates = [
                     os.path.join("models", "vec-768-layer-12.onnx"),
                     os.path.join(model_dir, "vec-768-layer-12.onnx"),
+                    os.path.join(appdata_models, "vec-768-layer-12.onnx"),
+                    os.path.join(localapp_models, "vec-768-layer-12.onnx"),
+                    os.path.join(script_models, "vec-768-layer-12.onnx"),
+                    os.path.join(exe_models, "vec-768-layer-12.onnx"),
                     "vec-768-layer-12.onnx",
                     os.path.join("models", "hubert_base.onnx"),
                     os.path.join(model_dir, "hubert_base.onnx"),
+                    os.path.join(appdata_models, "hubert_base.onnx"),
                     "hubert_base.onnx",
                 ]
                 hubert_path = next((c for c in candidates if os.path.isfile(c) and os.path.getsize(c) > 10_000_000), None)
@@ -922,13 +931,11 @@ class RealTimeDSPChain:
         np.multiply(x, self.gate_env, out=x)
 
         # 3. Optional ONNX AI Voice Model Inference (Zero-Roll Mirror Buffer)
-        onnx_applied = False
         if use_onnx and self.onnx_streamer.active:
             self.onnx_streamer.process_into(x)
-            onnx_applied = True
 
         # 4. Preset Character Effects (Automatically bypassed when ONNX AI Model is active)
-        if not onnx_applied:
+        if not use_onnx:
             # 4a. Bitwise Power-of-Two Circular Pitch Shifter (In-place, 36ms natural grain window)
             if abs(p.pitch_semitones) >= 0.05:
                 self.pitch_shifter.process_into(x, p.pitch_semitones)
@@ -1183,7 +1190,7 @@ class AudioEngineManager:
         try:
             self.dsp = RealTimeDSPChain(self.config.sample_rate)
             self.dsp.update_parameters(self.config.current_params)
-            if self.config.onnx_model_path and self.config.enable_onnx:
+            if self.config.onnx_model_path:
                 self.dsp.onnx_streamer.load_model(self.config.onnx_model_path)
 
             in_info = sd.query_devices(in_idx)
