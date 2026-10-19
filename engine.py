@@ -277,7 +277,7 @@ def fast_pade_tanh_inplace(x: np.ndarray, scratch_x2: np.ndarray, scratch_denom:
 class WaitFreeSpscRingBuffer:
     """
     Wait-Free Single-Producer Single-Consumer (SPSC) Ring Buffer.
-    - Backed by a power-of-two float32 array (2^14 = 16,384 samples) for bitwise '& MASK' indexing.
+    - Backed by a power-of-two float32 array for bitwise '& mask' indexing.
     - Uses monotonic integer cursors (_write_pos, _read_pos) so zero locks are ever acquired.
     - Adaptive pre-buffering (jitter cushion) prevents alternating-silence stutter between unsynced streams.
     - Preserves safety cushion during clock-drift correction instead of dropping to zero margin.
@@ -286,8 +286,10 @@ class WaitFreeSpscRingBuffer:
     CAPACITY = 16384
     MASK = 16383
 
-    def __init__(self, max_lag_samples: int = 1536, target_cushion: int = 512):
-        self._buf = np.zeros(self.CAPACITY, dtype=np.float32)
+    def __init__(self, capacity: int = 16384, max_lag_samples: int = 1536, target_cushion: int = 512):
+        self.capacity = capacity
+        self.mask = capacity - 1
+        self._buf = np.zeros(self.capacity, dtype=np.float32)
         self._write_pos: int = 0
         self._read_pos: int = 0
         self._max_lag = max_lag_samples
@@ -295,25 +297,28 @@ class WaitFreeSpscRingBuffer:
         self._primed = False
 
     def reset(self) -> None:
-        """Clears cursors and unprimes so next monitor stream begins with fresh cushion."""
+        """Clears cursors and unprimes so next stream begins with fresh cushion."""
         self._write_pos = 0
         self._read_pos = 0
         self._primed = False
         self._buf.fill(0.0)
 
+    def available_read(self) -> int:
+        return self._write_pos - self._read_pos
+
     def write(self, data: np.ndarray, gain: float = 1.0) -> None:
         n = len(data)
-        if n == 0 or n > self.CAPACITY:
+        if n == 0 or n > self.capacity:
             return
 
-        w_idx = self._write_pos & self.MASK
+        w_idx = self._write_pos & self.mask
         end = w_idx + n
-        if end <= self.CAPACITY:
+        if end <= self.capacity:
             np.multiply(data, gain, out=self._buf[w_idx:end])
         else:
-            first = self.CAPACITY - w_idx
+            first = self.capacity - w_idx
             np.multiply(data[:first], gain, out=self._buf[w_idx:])
-            np.multiply(data[first:], gain, out=self._buf[: end & self.MASK])
+            np.multiply(data[first:], gain, out=self._buf[: end & self.mask])
 
         # Single monotonic integer update (Producer-only write)
         self._write_pos += n
@@ -345,17 +350,31 @@ class WaitFreeSpscRingBuffer:
             r_pos = w_pos - cushion
             self._read_pos = r_pos
 
-        r_idx = r_pos & self.MASK
+        r_idx = r_pos & self.mask
         end = r_idx + n
-        if end <= self.CAPACITY:
+        if end <= self.capacity:
             out[:] = self._buf[r_idx:end]
         else:
-            first = self.CAPACITY - r_idx
+            first = self.capacity - r_idx
             out[:first] = self._buf[r_idx:]
-            out[first:] = self._buf[: end & self.MASK]
+            out[first:] = self._buf[: end & self.mask]
 
         # Single monotonic integer update (Consumer-only write)
         self._read_pos = r_pos + n
+
+    def read_chunk(self, n: int) -> np.ndarray:
+        out = np.empty(n, dtype=np.float32)
+        r_pos = self._read_pos
+        r_idx = r_pos & self.mask
+        end = r_idx + n
+        if end <= self.capacity:
+            out[:] = self._buf[r_idx:end]
+        else:
+            first = self.capacity - r_idx
+            out[:first] = self._buf[r_idx:]
+            out[first:] = self._buf[: end & self.mask]
+        self._read_pos = r_pos + n
+        return out
 
 
 class ZeroRollMirrorBuffer:
@@ -583,6 +602,8 @@ class ONNXVoiceStreamer:
     """
     Hardware-Accelerated ONNX Runtime Wrapper (NVIDIA CUDA / TensorRT / DirectML / CPU)
     supporting both Direct Waveform models and full RVC v2 Generative neural pipelines.
+    Runs asynchronous neural inference on a dedicated worker thread with wait-free SPSC
+    ring buffers, ensuring zero real-time audio callback blocking and zero raw voice leakage.
     """
 
     def __init__(self, sample_rate: int = 48000):
@@ -594,14 +615,77 @@ class ONNXVoiceStreamer:
         self.is_rvc = False
         self.input_name = ""
         self.hubert_input_name = "source"
-        self._rvc_in_accum = np.zeros(0, dtype=np.float32)
-        self._rvc_out_accum = np.zeros(0, dtype=np.float32)
+        self._in_ring = WaitFreeSpscRingBuffer(capacity=65536, max_lag_samples=48000, target_cushion=7680)
+        self._out_ring = WaitFreeSpscRingBuffer(capacity=65536, max_lag_samples=48000, target_cushion=7680)
+        self._worker_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self.current_pitch_semitones: float = 0.0
+
+    def set_pitch(self, semitones: float) -> None:
+        self.current_pitch_semitones = float(semitones)
+
+    def _start_worker(self) -> None:
+        self._stop_event.set()
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=0.2)
+        self._stop_event.clear()
+        self._in_ring.reset()
+        self._out_ring.reset()
+        self._worker_thread = threading.Thread(target=self._rvc_worker_loop, daemon=True, name="vcomms-rvc-worker")
+        self._worker_thread.start()
+
+    def _rvc_worker_loop(self) -> None:
+        chunk_samples = 7680  # 7680 @ 48kHz = 160ms (2560 @ 16kHz)
+        while not self._stop_event.is_set():
+            if not self.active or self.session is None or self.hubert_session is None:
+                time.sleep(0.02)
+                continue
+
+            avail = self._in_ring.available_read()
+            if avail < chunk_samples:
+                time.sleep(0.005)
+                continue
+
+            try:
+                chunk = self._in_ring.read_chunk(chunk_samples)
+                # 48kHz -> 16kHz downsampling (factor of 3 decimation)
+                audio_16k = chunk[::3].copy()
+                h_inp = audio_16k.reshape(1, 1, -1).astype(np.float32)
+
+                feats = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
+                if feats.ndim == 2:
+                    feats = feats[np.newaxis, ...]
+                T = feats.shape[1]
+                phone_lengths = np.array([T], dtype=np.int64)
+
+                nsff0, pitch = self._extract_f0(audio_16k, target_len=T, semitones=self.current_pitch_semitones)
+
+                # Run RVC Generator
+                out = self.session.run(None, {
+                    "phone": feats,
+                    "phone_lengths": phone_lengths,
+                    "pitch": pitch,
+                    "nsff0": nsff0,
+                    "sid": np.array([0], dtype=np.int64),
+                })[0]
+                synth = np.asarray(out, dtype=np.float32).ravel()
+
+                if len(synth) > 0:
+                    synth_48k = np.interp(
+                        np.linspace(0, len(synth), len(chunk), endpoint=False),
+                        np.arange(len(synth)),
+                        synth,
+                    ).astype(np.float32)
+                    self._out_ring.write(synth_48k)
+            except Exception:
+                pass
 
     def load_model(self, model_path: str) -> Tuple[bool, str]:
         if not ONNX_AVAILABLE:
             return False, "onnxruntime is not installed."
         if not os.path.isfile(model_path):
             return False, "Model file not found."
+        self.unload()
         try:
             rt = _load_onnxruntime()
             # Prioritize NVIDIA RTX GPU acceleration via CUDA/TensorRT, then DirectML for DirectX 12 hardware acceleration
@@ -650,7 +734,26 @@ class ONNXVoiceStreamer:
                 self.hubert_session = rt.InferenceSession(hubert_path, sess_options=sess_opts, providers=available)
                 h_inps = self.hubert_session.get_inputs()
                 self.hubert_input_name = h_inps[0].name if h_inps else "source"
+
+                # Pre-warm GPU execution providers and compile DirectX 12 shaders immediately
+                try:
+                    dummy_h = np.zeros((1, 1, 2560), dtype=np.float32)
+                    dummy_feats = self.hubert_session.run(None, {self.hubert_input_name: dummy_h})[0]
+                    if dummy_feats.ndim == 2:
+                        dummy_feats = dummy_feats[np.newaxis, ...]
+                    dT = dummy_feats.shape[1]
+                    self.session.run(None, {
+                        "phone": dummy_feats,
+                        "phone_lengths": np.array([dT], dtype=np.int64),
+                        "pitch": np.full((1, dT), 54, dtype=np.int64),
+                        "nsff0": np.full((1, dT), 200.0, dtype=np.float32),
+                        "sid": np.array([0], dtype=np.int64),
+                    })
+                except Exception:
+                    pass
+
                 self.active = True
+                self._start_worker()
                 prov = self.session.get_providers()[0]
                 return True, f"RVC Loaded on {prov} (RTX Hardware Accelerated)"
             else:
@@ -664,23 +767,34 @@ class ONNXVoiceStreamer:
             return False, str(exc)
 
     def unload(self) -> None:
-        """Forgets the model (and frees its memory). The audio thread checks ``active`` before every inference."""
+        """Forgets the model (and frees its memory). Stops the background worker thread."""
         self.active = False
+        self._stop_event.set()
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=0.2)
+        self._worker_thread = None
         self.session = None
         self.hubert_session = None
         self.is_rvc = False
         self.input_name = ""
-        self._rvc_in_accum = np.zeros(0, dtype=np.float32)
-        self._rvc_out_accum = np.zeros(0, dtype=np.float32)
+        self._in_ring.reset()
+        self._out_ring.reset()
 
-    def _extract_f0(self, audio_16k: np.ndarray, hop_size: int = 320) -> Tuple[np.ndarray, np.ndarray]:
-        n_frames = max(1, len(audio_16k) // hop_size)
-        f0 = np.zeros(n_frames, dtype=np.float32)
+    def _extract_f0(
+        self,
+        audio_16k: np.ndarray,
+        target_len: Optional[int] = None,
+        semitones: float = 0.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if target_len is None:
+            target_len = max(1, len(audio_16k) // 320)
+        f0 = np.zeros(target_len, dtype=np.float32)
         min_lag = int(16000 / 1100)
         max_lag = int(16000 / 50)
-        for i in range(n_frames):
-            start = i * hop_size
-            frame = audio_16k[start : start + hop_size * 2] if start + hop_size * 2 <= len(audio_16k) else audio_16k[start:]
+        hop = len(audio_16k) / float(target_len)
+        for i in range(target_len):
+            start = int(round(i * hop))
+            frame = audio_16k[start : start + max_lag * 2] if start + max_lag * 2 <= len(audio_16k) else audio_16k[start:]
             if len(frame) >= max_lag:
                 corr = np.correlate(frame, frame, mode='full')
                 corr = corr[len(frame) - 1 :]
@@ -689,6 +803,9 @@ class ONNXVoiceStreamer:
                     if len(lag_region) > 0 and np.max(lag_region) > 0.25 * corr[0]:
                         peak_lag = min_lag + np.argmax(lag_region)
                         f0[i] = 16000.0 / float(peak_lag)
+
+        if abs(semitones) > 0.05:
+            f0 *= 2.0 ** (semitones / 12.0)
 
         # nsff0: continuous f0 in Hz
         nsff0 = f0.reshape(1, -1).astype(np.float32)
@@ -715,49 +832,20 @@ class ONNXVoiceStreamer:
                 out_flat = np.asarray(out, dtype=np.float32).ravel()
                 if len(out_flat) >= n:
                     x[:] = out_flat[-n:]
+                else:
+                    x.fill(0.0)
             except Exception:
-                pass
+                x.fill(0.0)
             return
 
-        # RVC Model Pipeline
-        if self.hubert_session is None:
-            return
+        # RVC Model Pipeline: asynchronous inference via wait-free SPSC ring buffers
+        # 1. Enqueue incoming microphone audio to the neural inference queue
+        self._in_ring.write(x)
 
-        self._rvc_in_accum = np.concatenate([self._rvc_in_accum, x])
-        chunk_threshold = 3840  # 3840 @ 48kHz = 1280 @ 16kHz = exactly 4 frames of 20ms
-        if len(self._rvc_in_accum) >= chunk_threshold:
-            try:
-                # 48kHz -> 16kHz downsampling (factor of 3 decimation)
-                audio_16k = self._rvc_in_accum[::3].copy()
-                nsff0, pitch = self._extract_f0(audio_16k, hop_size=320)
-                T = nsff0.shape[1]
-                phone_lengths = np.array([T], dtype=np.int64)
-
-                # Extract HuBERT embeddings
-                h_inp = audio_16k.reshape(1, -1).astype(np.float32)
-                feats = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
-                if feats.ndim == 2:
-                    feats = feats[np.newaxis, ...]
-
-                # Run RVC Generator
-                out = self.session.run(None, {
-                    "phone": feats,
-                    "phone_lengths": phone_lengths,
-                    "pitch": pitch,
-                    "nsff0": nsff0,
-                    "sid": np.array([0], dtype=np.int64),
-                })[0]
-                synth = np.asarray(out, dtype=np.float32).ravel()
-                self._rvc_out_accum = np.concatenate([self._rvc_out_accum, synth])
-                self._rvc_in_accum = self._rvc_in_accum[chunk_threshold:]
-            except Exception:
-                self._rvc_in_accum = self._rvc_in_accum[chunk_threshold:]
-
-        # Drain synthesized neural audio into x
-        if len(self._rvc_out_accum) >= n:
-            x[:] = self._rvc_out_accum[:n]
-            self._rvc_out_accum = self._rvc_out_accum[n:]
-
+        # 2. Dequeue synthesized neural audio into x.
+        # If the output buffer is empty or priming, read_into fills x with silence (0.0),
+        # ensuring the user's raw microphone voice NEVER leaks into the output.
+        self._out_ring.read_into(x)
 
 # ============================================================================
 # 3. WAIT-FREE REAL-TIME DSP PIPELINE
@@ -930,8 +1018,9 @@ class RealTimeDSPChain:
         self.gate_env = alpha * target_gate + (1.0 - alpha) * self.gate_env
         np.multiply(x, self.gate_env, out=x)
 
-        # 3. Optional ONNX AI Voice Model Inference (Zero-Roll Mirror Buffer)
+        # 3. Optional ONNX AI Voice Model Inference (Zero-Roll Mirror Buffer / Asynchronous SPSC Neural Pipeline)
         if use_onnx and self.onnx_streamer.active:
+            self.onnx_streamer.set_pitch(p.pitch_semitones)
             self.onnx_streamer.process_into(x)
 
         # 4. Preset Character Effects (Automatically bypassed when ONNX AI Model is active)
@@ -1296,6 +1385,8 @@ class AudioEngineManager:
             except Exception:
                 pass
             self.primary_stream = None
+        if self.dsp and self.dsp.onnx_streamer:
+            self.dsp.onnx_streamer.unload()
         self.latest_in_db = -80.0
         self.latest_out_db = -80.0
         self._set_status("STOPPED")
