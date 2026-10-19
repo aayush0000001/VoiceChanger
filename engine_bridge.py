@@ -101,6 +101,7 @@ class EngineBridge(QObject):
     path_test_state = pyqtSignal(object)  # {"running": bool}
     path_test_finished = pyqtSignal(object)    # {"passed": bool, "steps": [{"status", "stage", "text"}]}
     onnx_changed = pyqtSignal(object)     # {"available", "enabled", "path", "message"}
+    hubert_download_requested = pyqtSignal(str)   # path of model waiting for HuBERT base model
     profile_changed = pyqtSignal(object)  # {"path": str, "autoloaded": bool}
     hotkeys_changed = pyqtSignal(object)  # {"items": [{id, text, bound, registered, conflict}], "all_default": bool}
     hotkey_capture_ready = pyqtSignal(str)  # action id: every hotkey is switched off, so the page can listen for keys
@@ -1096,7 +1097,13 @@ class EngineBridge(QObject):
             self.config.enable_onnx = False
         self.flags_changed.emit(self._flags_payload())
         self.onnx_changed.emit(self._onnx_payload(message))
-        self._notify("success" if ok else "error", "ONNX Voice Model", message)
+        if ok:
+            self._notify("success", "ONNX Voice Model", message)
+        else:
+            if message.startswith("NEED_HUBERT"):
+                self.hubert_download_requested.emit(path)
+            else:
+                self._notify("error", "ONNX Voice Model", message)
 
     # ======================================================================================================
     # problem reports (Settings > Report a problem)

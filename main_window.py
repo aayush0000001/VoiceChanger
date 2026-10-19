@@ -33,7 +33,8 @@ import reporting
 from appinfo import APP_NAME
 from engine_bridge import EngineBridge
 from views import DevicesView, LiveView, SettingsView, VoiceView
-from views.dialogs import ReportDialog
+from views.dialogs import HuBERTDownloadDialog, ReportDialog
+from hubert_downloader import HuBERTDownloadWorker
 from views.widgets import Toasts
 
 THEME_KEYS = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
@@ -244,6 +245,7 @@ class MainWindow(FluentWindow):
         b.path_test_finished.connect(self.on_path_test_finished)
         b.onnx_changed.connect(sv.apply_onnx)
         b.onnx_changed.connect(lv.apply_onnx)
+        b.hubert_download_requested.connect(self.prompt_hubert_download)
         b.profile_changed.connect(sv.apply_profile)
         b.hotkeys_changed.connect(sv.apply_hotkeys)
         b.hotkeys_changed.connect(lv.apply_hotkeys)
@@ -365,6 +367,39 @@ class MainWindow(FluentWindow):
     def request_report(self) -> None:
         versions = f"Qt {QT_VERSION_STR}  |  PyQt {PYQT_VERSION_STR}  |  QFluentWidgets {qfluentwidgets.__version__}"
         self.reportPrepareRequested.emit(versions)
+
+
+    def prompt_hubert_download(self, target_model_path: str) -> None:
+        model_name = Path(target_model_path).name
+        dialog = HuBERTDownloadDialog(self, target_model_name=model_name)
+
+        def start_download() -> None:
+            dialog.set_downloading()
+            worker = HuBERTDownloadWorker(parent=dialog)
+            dialog.cancelButton.clicked.connect(worker.cancel)
+            worker.progress.connect(dialog.update_progress)
+
+            def on_finished(success: bool, msg: str) -> None:
+                dialog.close()
+                if success:
+                    self.show_notification({
+                        "level": "success",
+                        "title": "HuBERT Base Installed",
+                        "text": "Loading your voice model now...",
+                    })
+                    self.bridge.load_onnx_model(target_model_path)
+                else:
+                    self.show_notification({
+                        "level": "error",
+                        "title": "Download Failed",
+                        "text": msg,
+                    })
+
+            worker.finished.connect(on_finished)
+            worker.start()
+
+        dialog.yesButton.clicked.connect(start_download)
+        dialog.open()
 
     def open_report_dialog(self, data: dict) -> None:
         if data["sending"]:

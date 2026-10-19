@@ -17,6 +17,7 @@ from qfluentwidgets import (
     LineEdit,
     MessageBoxBase,
     PlainTextEdit,
+    ProgressBar,
     PushButton,
     ScrollArea,
     StrongBodyLabel,
@@ -329,3 +330,51 @@ class ReportDialog(FastMessageBox):
             field, self.typeBox
         ).setFocus()
         return False
+
+
+class HuBERTDownloadDialog(FastMessageBox):
+    """Prompts the user to download the HuBERT ContentVec base model required for RVC voice models."""
+
+    def __init__(self, parent: QWidget, target_model_name: str = ""):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel("AI Neural Voice Base Model Required"))
+        desc = (
+            f"The selected model ('{target_model_name}') is an RVC neural voice model.\n\n"
+            "It requires the HuBERT ContentVec neural base model (~360 MB) for hardware-accelerated "
+            "RTX / DirectML GPU conversion.\n\n"
+            "Would you like V-COMMS to download it automatically now?"
+        )
+        self.bodyLabel = BodyLabel(desc)
+        self.bodyLabel.setWordWrap(True)
+        self.viewLayout.addWidget(self.bodyLabel)
+
+        self.progressBar = ProgressBar(self)
+        self.progressBar.setValue(0)
+        self.progressBar.hide()
+        self.viewLayout.addWidget(self.progressBar)
+
+        self.statusLabel = CaptionLabel("")
+        self.statusLabel.hide()
+        self.viewLayout.addWidget(self.statusLabel)
+
+        self.yesButton.setText("Download Now")
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(460)
+        self.widget.setMaximumWidth(540)
+        try:
+            self.yesButton.disconnect()
+        except Exception:
+            pass
+
+    def set_downloading(self) -> None:
+        self.bodyLabel.setText("Downloading HuBERT ContentVec neural base model (vec-768-layer-12.onnx)...\nThis is a one-time download.")
+        self.yesButton.setEnabled(False)
+        self.progressBar.show()
+        self.statusLabel.show()
+
+    def update_progress(self, pct: int, mb: float, total_mb: float) -> None:
+        self.progressBar.setValue(pct)
+        if total_mb > 0:
+            self.statusLabel.setText(f"{mb:.1f} MB / {total_mb:.1f} MB ({pct}%)")
+        else:
+            self.statusLabel.setText(f"{mb:.1f} MB downloaded...")

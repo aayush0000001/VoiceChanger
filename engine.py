@@ -645,7 +645,7 @@ class ONNXVoiceStreamer:
                 hubert_path = next((c for c in candidates if os.path.isfile(c) and os.path.getsize(c) > 10_000_000), None)
                 if not hubert_path:
                     self.active = False
-                    return False, "RVC model detected! Place 'vec-768-layer-12.onnx' in models/ to enable RTX voice conversion (or run download_rvc_models.py)."
+                    return False, "NEED_HUBERT:RVC model detected! HuBERT base model (vec-768-layer-12.onnx) is required."
 
                 self.hubert_session = rt.InferenceSession(hubert_path, sess_options=sess_opts, providers=available)
                 h_inps = self.hubert_session.get_inputs()
