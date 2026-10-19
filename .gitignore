@@ -34,6 +34,11 @@ logs/
 *.bad
 *.tmp
 
+# Scratch notes and temporary drafts
+scratch.txt
+challenges_and_solutions.txt
+scratch/
+
 # AI Voice Weights & Heavy Checkpoints (keep repo lightweight)
 models/
 weights/

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QHBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, PrimaryPushButton, StrongBodyLabel, SwitchButton, TransparentPushButton
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QWidget
+from qfluentwidgets import CaptionLabel, FluentIcon, PrimaryPushButton, PushButton, StrongBodyLabel, SwitchButton, TransparentPushButton
 
 from styles import GAP_SM
 from .dialogs import ConfirmDialog, NameDialog, ask_preset_export_path, ask_preset_import_path
 from .widgets import (
     Card,
+    Chip,
     GroupCard,
     LevelMeter,
     MeterBar,
@@ -38,7 +41,9 @@ class LiveView(PageBase):
     presetExportRequested = pyqtSignal(str, str)    # preset key, file path
     presetDeleteRequested = pyqtSignal(str)         # custom preset key
     presetImportRequested = pyqtSignal(str)         # file path
-    flagToggled = pyqtSignal(str, bool)        # "mic_muted" | "bypass_effects", new value
+    flagToggled = pyqtSignal(str, bool)
+    onnxModelSelected = pyqtSignal(str)
+    quitRequested = pyqtSignal()        # "mic_muted" | "bypass_effects", new value
 
     MUTE_CAPTION = "Silences the output."
     BYPASS_CAPTION = "Raw voice, no effects."
@@ -63,18 +68,42 @@ class LiveView(PageBase):
         self.engineButton = PrimaryPushButton(FluentIcon.PLAY, "Start audio engine")
         self.engineButton.setMinimumWidth(188)
         self.engineButton.clicked.connect(self.engineToggleRequested)
+        self.quitButton = TransparentPushButton(FluentIcon.POWER_BUTTON, "Exit")
+        self.quitButton.setToolTip("Completely quit and close V-COMMS")
+        self.quitButton.clicked.connect(self.quitRequested)
         self.actions.addWidget(self.statusPill)
         self.actions.addWidget(self.engineButton)
+        self.actions.addWidget(self.quitButton)
+
+        # AI Neural Voice Model card (Presentable Box on Main Menu)
+        self.aiCard = GroupCard("AI Voice Model (ONNX)")
+        self.aiCard.headerLayout.addSpacing(GAP_SM)
+        self.aiCard.headerLayout.addWidget(Chip("EXPERIMENTAL", accent=True))
+        self.aiCard.headerLayout.addStretch(1)
+        self.onnxSwitch = self._make_switch("enable_onnx")
+        self.aiSwitchRow = self.aiCard.add_row(
+            FluentIcon.ROBOT,
+            "Enable ONNX AI voice model",
+            "Bypasses regular presets and streams directly through your neural AI model.",
+            self.onnxSwitch,
+        )
+        self.modelButton = PushButton(FluentIcon.FOLDER, "Select .ONNX Model…")
+        self.modelButton.clicked.connect(self._pick_onnx_model)
+        self.modelRow = self.aiCard.add_row(
+            FluentIcon.MUSIC, "Active model", "No model selected.", self.modelButton
+        )
+        self.modelRow.contentLabel.setElideMode(Qt.TextElideMode.ElideMiddle)
+        self.content.addWidget(self.aiCard)
 
         # voice presets (tiles are created by set_presets)
         section = QHBoxLayout()
         section.setContentsMargins(0, 0, 0, 0)
-        title = StrongBodyLabel("Voice presets")
-        title.setContentsMargins(2, GAP_SM, 0, 0)
+        self.presetsTitle = StrongBodyLabel("Voice presets")
+        self.presetsTitle.setContentsMargins(2, GAP_SM, 0, 0)
         self.importButton = TransparentPushButton(FluentIcon.DOWNLOAD, "Import preset…")
         self.importButton.setToolTip("Add a preset someone sent you (a .json file)")
         self.importButton.clicked.connect(self._import_preset)
-        section.addWidget(title)
+        section.addWidget(self.presetsTitle)
         section.addStretch(1)
         section.addWidget(self.importButton)
         self.content.addLayout(section)
@@ -135,8 +164,46 @@ class LiveView(PageBase):
         return switch
 
     # ------------------------------------------------------------------ slots (bridge -> view)
+    def _pick_onnx_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select ONNX Voice Model", str(Path.cwd()), "ONNX Models (*.onnx)"
+        )
+        if path:
+            self.onnxModelSelected.emit(path)
+
+    def _update_presets_state(self, onnx_active: bool) -> None:
+        self.tileGrid.setEnabled(not onnx_active)
+        self.femaleGrid.setEnabled(not onnx_active)
+        self.femaleTitle.setEnabled(not onnx_active)
+        if onnx_active:
+            self.presetsTitle.setText("Voice presets (Bypassed by AI Model)")
+        else:
+            self.presetsTitle.setText("Voice presets")
+
+        eff1 = QGraphicsOpacityEffect(self.tileGrid)
+        eff1.setOpacity(0.38 if onnx_active else 1.0)
+        self.tileGrid.setGraphicsEffect(eff1)
+
+        eff2 = QGraphicsOpacityEffect(self.femaleGrid)
+        eff2.setOpacity(0.38 if onnx_active else 1.0)
+        self.femaleGrid.setGraphicsEffect(eff2)
+
+    def apply_onnx(self, data: dict) -> None:
+        path = data.get("path", "")
+        if path:
+            self.modelRow.contentLabel.setText(Path(path).name)
+        else:
+            self.modelRow.contentLabel.setText("No model selected.")
+        onnx_on = bool(data.get("enabled", False))
+        set_switch(self.onnxSwitch, onnx_on)
+        self._update_presets_state(onnx_on)
+
     def set_catalog(self, data: dict) -> None:
         self._reserved = list(data["preset_rules"]["reserved"])
+        self.onnxSwitch.setEnabled(data.get("onnx_available", False))
+        self.modelButton.setEnabled(data.get("onnx_available", False))
+        if not data.get("onnx_available", False):
+            self.aiSwitchRow.contentLabel.setText("onnxruntime is not installed, so AI voice conversion is unavailable.")
 
     def set_presets(self, data: dict) -> None:
         """Built-in tiles first (Ctrl+Alt+F1..F4), then the player's own; the female voices get a section of their own."""
@@ -232,6 +299,10 @@ class LiveView(PageBase):
         def apply() -> None:
             set_switch(self.muteSwitch, bool(flags["mic_muted"]))
             set_switch(self.bypassSwitch, bool(flags["bypass_effects"]))
+            if "enable_onnx" in flags:
+                onnx_on = bool(flags["enable_onnx"])
+                set_switch(self.onnxSwitch, onnx_on)
+                self._update_presets_state(onnx_on)
 
         self.update_when_shown("flags", apply)
 
