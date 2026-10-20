@@ -1,8 +1,8 @@
-import hashlib
 """Background worker to download the HuBERT ContentVec base model on demand without freezing the UI."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import urllib.request
 from pathlib import Path
