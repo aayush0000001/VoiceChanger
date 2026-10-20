@@ -34,7 +34,8 @@ def get_logger() -> logging.Logger:
 def setup_logging() -> logging.Logger:
     """Idempotent. Falls back to a null handler when the log folder cannot be written."""
     logger = get_logger()
-    if logger.handlers:
+    # look for our own handler: one somebody else attached (a test runner, a debugger) must not stand in for the file
+    if any(getattr(h, "_vcomms", False) for h in logger.handlers):
         return logger
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -43,9 +44,10 @@ def setup_logging() -> logging.Logger:
         path.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(path, maxBytes=MAX_BYTES, backupCount=1, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(handler)
     except OSError:
-        logger.addHandler(logging.NullHandler())
+        handler = logging.NullHandler()
+    handler._vcomms = True
+    logger.addHandler(handler)
     return logger
 
 

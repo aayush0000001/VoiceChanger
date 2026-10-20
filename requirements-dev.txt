@@ -1,0 +1,5 @@
+# For running the test suite (python -m pytest). The app itself only needs requirements.txt.
+-r requirements.txt
+pytest>=8.0
+onnx>=1.15        # builds the small stand-in HuBERT / RVC models the AI-voice tests run through ONNX Runtime
+onnxruntime>=1.17 ; sys_platform != "win32"   # on Windows requirements.txt already brings onnxruntime-directml

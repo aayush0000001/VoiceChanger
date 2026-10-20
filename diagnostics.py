@@ -110,6 +110,12 @@ def build_diagnostics(snapshot: Dict, log_lines: int = LOG_LINES_IN_REPORT) -> s
         )
     else:
         lines.append("Audio engine: not started since launch (no DSP timing yet)")
+    ai = s.get("ai_model") or {}
+    if ai.get("loaded") or ai.get("errors"):
+        line = f"AI model: {'loaded (' + ai.get('kind', '') + ')' if ai.get('loaded') else 'not loaded'}"
+        if ai.get("errors"):
+            line += f"  |  {ai['errors']} conversion errors, last: {str(ai.get('last_error', ''))[:200]}"
+        lines.append(line)
 
     log = applog.tail(log_lines)
     lines.append("")

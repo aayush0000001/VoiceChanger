@@ -24,10 +24,12 @@ import os
 import platform
 import queue
 import sys
+from collections import OrderedDict
+import tempfile
 import threading
 import time
 import tracemalloc
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
@@ -47,7 +49,7 @@ from scipy.signal._sigtools import _linear_filter
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):  # OSError: the module is there but the PortAudio library is not
     sd = None
     SOUNDDEVICE_AVAILABLE = False
 
@@ -286,8 +288,13 @@ class WaitFreeSpscRingBuffer:
 
     CAPACITY = 16384
     MASK = 16383
+    UNDERRUN_FADE = 16
+    # the micro-underrun fade-outs, one per length, made once so an underrun allocates nothing in the audio callback
+    _FADE_RAMPS = tuple(np.linspace(1.0, 0.0, k, dtype=np.float32) for k in range(UNDERRUN_FADE + 1))
 
     def __init__(self, capacity: int = 16384, max_lag_samples: int = 1536, target_cushion: int = 512):
+        if capacity <= 0 or capacity & (capacity - 1):
+            raise ValueError("capacity must be a power of two (the cursors wrap with '& mask')")
         self.capacity = capacity
         self.mask = capacity - 1
         self._buf = np.zeros(self.capacity, dtype=np.float32)
@@ -354,8 +361,8 @@ class WaitFreeSpscRingBuffer:
                     first = self.capacity - r_idx
                     out[:first] = self._buf[r_idx:]
                     out[first:avail] = self._buf[: end & self.mask]
-                fade_len = min(16, avail)
-                out[avail - fade_len : avail] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                fade_len = min(self.UNDERRUN_FADE, avail)
+                out[avail - fade_len : avail] *= self._FADE_RAMPS[fade_len]
                 out[avail:].fill(0.0)
                 self._read_pos = r_pos + avail
             else:
@@ -373,7 +380,9 @@ class WaitFreeSpscRingBuffer:
         # Clock-drift guard: prevent buildup of side-tone latency, but retain cushion so
         # the very next callback does not immediately underflow
         if avail > self._max_lag:
-            r_pos = w_pos - cushion
+            # never closer to the writer than this read: a block larger than the cushion would otherwise run past the
+            # write cursor into audio from a lap ago (avail >= n here, so the cursor still only moves forward)
+            r_pos = w_pos - max(cushion, n)
             self._read_pos = r_pos
 
         r_idx = r_pos & self.mask
@@ -462,7 +471,9 @@ class BitwiseCircularPitchShifter:
     """
     Power-of-Two Dual-Head Rotating Delay-Line Pitch Shifter.
     - Uses C = 4096 (2^12) circular buffer with bitwise '& 4095' wrapping.
-    - Pre-allocates all scratch vectors at initialization -> ZERO heap allocations in process_into().
+    - Pre-allocates all scratch vectors at initialization -> process_into() creates no arrays (only NumPy's internal
+      buffer for the one float -> index cast, which a block-sized copy never needs).
+    - Both read heads are one (2, n) array, so every step of the interpolation is a single NumPy call for both.
     - Uses single-multiply FMA lerp: y = y0 + frac * (y1 - y0)
     - Uses complementary Hann identity: out = val_b + gain_a * (val_a - val_b)
       (eliminates second cosine evaluation and gain_b array completely).
@@ -478,59 +489,55 @@ class BitwiseCircularPitchShifter:
         self.write_idx: int = 0
         self.phase: float = 0.0
 
-        # Pre-allocated scratch arena for O(1) space complexity
-        self._arange_i32 = np.arange(MAX_BLOCK_SIZE, dtype=np.int32)
+        # Pre-allocated scratch arena for O(1) space complexity. The two-head arrays are kept flat and viewed as
+        # (2, n), so the view is C-contiguous for every block size and np.take can write into it directly.
+        two = 2 * MAX_BLOCK_SIZE
+        self._arange_f32 = np.arange(MAX_BLOCK_SIZE, dtype=np.float32)
         self._steps_f32 = np.arange(1, MAX_BLOCK_SIZE + 1, dtype=np.float32)
-        self._w_idxs = np.zeros(MAX_BLOCK_SIZE, dtype=np.int32)
-        self._phases_a = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._phases_b = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._read_pos = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._idx0 = np.zeros(MAX_BLOCK_SIZE, dtype=np.int32)
-        self._idx1 = np.zeros(MAX_BLOCK_SIZE, dtype=np.int32)
-        self._frac = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._val_a = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._val_b = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
-        self._tmp_interp = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
+        self._w_pos = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
         self._gain_a = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
+        self._phases = np.zeros(two, dtype=np.float32)    # row 0: head A, row 1: head B (half a window later)
+        self._read_pos = np.zeros(two, dtype=np.float32)  # read position, then its fractional part
+        self._floor = np.zeros(two, dtype=np.float32)
+        self._idx0 = np.zeros(two, dtype=np.intp)          # intp: np.take uses these without converting them
+        self._idx1 = np.zeros(two, dtype=np.intp)
+        self._val0 = np.zeros(two, dtype=np.float32)
+        self._val1 = np.zeros(two, dtype=np.float32)
+        self._views: Dict[int, tuple] = {}  # block size -> the scratch views for it (made once per size)
 
-    def _interp_head(
-        self,
-        w_idxs: np.ndarray,
-        phases: np.ndarray,
-        out_val: np.ndarray,
-        n: int,
-    ) -> None:
-        read_pos = self._read_pos[:n]
-        idx0 = self._idx0[:n]
-        idx1 = self._idx1[:n]
-        frac = self._frac[:n]
-        tmp = self._tmp_interp[:n]
+    def _views_for(self, n: int) -> tuple:
+        views = self._views.get(n)
+        if views is None:
+            def two_rows(a: np.ndarray) -> np.ndarray:
+                return a[: 2 * n].reshape(2, n)
 
-        np.multiply(phases, self.win_size, out=read_pos)
-        np.subtract(w_idxs, read_pos, out=read_pos)
-        np.floor(read_pos, out=frac)
-        np.copyto(idx0, frac, casting="unsafe")
-        np.subtract(read_pos, frac, out=frac)  # Fractional part in [0.0, 1.0)
+            phases, val0, val1 = two_rows(self._phases), two_rows(self._val0), two_rows(self._val1)
+            views = (
+                phases, phases[0], phases[1], self._steps_f32[:n], self._arange_f32[:n], self._w_pos[:n],
+                two_rows(self._read_pos), two_rows(self._floor), two_rows(self._idx0), two_rows(self._idx1),
+                val0, val1, val0[0], val0[1], val1[0], self._gain_a[:n],
+            )
+            self._views[n] = views
+        return views
 
-        np.bitwise_and(idx0, self.MASK, out=idx0)
-        np.add(idx0, 1, out=idx1)
-        np.bitwise_and(idx1, self.MASK, out=idx1)
-
-        out_val[:] = self.buffer[idx0]
-        tmp[:] = self.buffer[idx1]
-        # Single-multiply lerp: out_val = y0 + frac * (y1 - y0)
-        np.subtract(tmp, out_val, out=tmp)
-        np.multiply(tmp, frac, out=tmp)
-        np.add(out_val, tmp, out=out_val)
+    def _write(self, x: np.ndarray) -> None:
+        """Appends ``x`` to the delay line (two slice copies at most, no index array)."""
+        n = len(x)
+        w = self.write_idx
+        end = w + n
+        if end <= self.CAPACITY:
+            self.buffer[w:end] = x
+        else:
+            first = self.CAPACITY - w
+            self.buffer[w:] = x[:first]
+            self.buffer[: end - self.CAPACITY] = x[first:]
+        self.write_idx = end & self.MASK
 
     def process_into(self, x: np.ndarray, semitones: float) -> None:
         """Processes `x` in-place with zero heap allocations."""
         n = len(x)
-        w_idxs = self._w_idxs[:n]
-        np.add(self.write_idx, self._arange_i32[:n], out=w_idxs)
-        np.bitwise_and(w_idxs, self.MASK, out=w_idxs)
-        self.buffer[w_idxs] = x
-        self.write_idx = (self.write_idx + n) & self.MASK
+        w = self.write_idx
+        self._write(x)
 
         if abs(semitones) < 0.05:
             return
@@ -538,22 +545,32 @@ class BitwiseCircularPitchShifter:
         pitch_ratio = 2.0 ** (semitones / 12.0)
         phasor_step = (1.0 - pitch_ratio) / self.win_size
 
-        phases_a = self._phases_a[:n]
-        phases_b = self._phases_b[:n]
-        val_a = self._val_a[:n]
-        val_b = self._val_b[:n]
-        gain_a = self._gain_a[:n]
-
-        np.multiply(self._steps_f32[:n], phasor_step, out=phases_a)
+        (phases, phases_a, phases_b, steps, arange, w_pos, read_pos, floor, idx0, idx1,
+         val0, val1, val_a, val_b, diff, gain_a) = self._views_for(n)
+        np.multiply(steps, phasor_step, out=phases_a)
         np.add(phases_a, self.phase, out=phases_a)
         np.mod(phases_a, 1.0, out=phases_a)
         self.phase = float(phases_a[-1])
-
         np.add(phases_a, 0.5, out=phases_b)
         np.mod(phases_b, 1.0, out=phases_b)
 
-        self._interp_head(w_idxs, phases_a, val_a, n)
-        self._interp_head(w_idxs, phases_b, val_b, n)
+        # Both heads: read position = write position - phase * window, split into integer index and fraction
+        np.add(arange, w, out=w_pos)  # unmasked: '& MASK' on the integer part wraps it below
+        np.multiply(phases, self.win_size, out=read_pos)
+        np.subtract(w_pos, read_pos, out=read_pos)
+        np.floor(read_pos, out=floor)
+        np.copyto(idx0, floor, casting="unsafe")
+        np.subtract(read_pos, floor, out=read_pos)  # Fractional part in [0.0, 1.0)
+        np.bitwise_and(idx0, self.MASK, out=idx0)
+        np.add(idx0, 1, out=idx1)
+        np.bitwise_and(idx1, self.MASK, out=idx1)
+
+        # Single-multiply lerp: val0 = y0 + frac * (y1 - y0)   ('clip' never fires: the indices are masked already)
+        np.take(self.buffer, idx0, out=val0, mode="clip")
+        np.take(self.buffer, idx1, out=val1, mode="clip")
+        np.subtract(val1, val0, out=val1)
+        np.multiply(val1, read_pos, out=val1)
+        np.add(val0, val1, out=val0)
 
         # Raised cosine window for Head A: gain_a = 0.5 * (1.0 - cos(2*pi*phases_a))
         np.multiply(phases_a, 2.0 * np.pi, out=gain_a)
@@ -562,16 +579,17 @@ class BitwiseCircularPitchShifter:
         np.multiply(gain_a, 0.5, out=gain_a)
 
         # Complementary Hann identity: x = val_b + gain_a * (val_a - val_b)
-        np.subtract(val_a, val_b, out=val_a)
-        np.multiply(gain_a, val_a, out=val_a)
-        np.add(val_b, val_a, out=x)
+        np.subtract(val_a, val_b, out=diff)
+        np.multiply(gain_a, diff, out=diff)
+        np.add(val_b, diff, out=x)
 
 
 class VectorizedDarkReverb:
     """
     Parallel Schroeder Comb + True Sample-Accurate One-Pole IIR Damping Spatializer.
-    Because block_size N <= 512 is strictly less than min(comb_delays) = 1116,
-    each block read is causal and executes via C-level scipy.signal.lfilter with zero Python loops.
+    A comb line can only hand out as many delayed samples as it is long, so blocks longer than the shortest comb
+    (1116 samples at 48 kHz; the app's blocks are 128-512) are processed in pieces of at most that length. Every
+    piece read is then causal and executes via C-level scipy.signal.lfilter with zero per-sample Python loops.
     """
 
     def __init__(self, sample_rate: int = 48000):
@@ -579,12 +597,14 @@ class VectorizedDarkReverb:
         self.comb_delays = [max(600, int(d * scale)) for d in (1116, 1356, 1492)]
         self.comb_bufs = [np.zeros(d, dtype=np.float32) for d in self.comb_delays]
         self.comb_idxs = [0, 0, 0]
+        self._max_piece = min(self.comb_delays)
 
         # One-pole low-pass damping IIR coefficients: y[n] = (1 - d)*x[n] + d*y[n-1]
         damp = 0.45
         self._b_damp = np.array([1.0 - damp], dtype=np.float32)
         self._a_damp = np.array([1.0, -damp], dtype=np.float32)
         self._lp_zis = [np.zeros(1, dtype=np.float32) for _ in range(3)]
+        self._feedback = np.float32(0.62)
 
         # Pre-allocated scratch buffers
         self._wet = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
@@ -595,11 +615,18 @@ class VectorizedDarkReverb:
         if mix <= 0.01:
             return
         n = len(x)
+        if n <= self._max_piece:
+            self._process_piece(x, mix)
+            return
+        for start in range(0, n, self._max_piece):
+            self._process_piece(x[start : start + self._max_piece], mix)
+
+    def _process_piece(self, x: np.ndarray, mix: float) -> None:
+        n = len(x)
         wet = self._wet[:n]
         delayed = self._delayed[:n]
         write_scratch = self._write_scratch[:n]
-        wet.fill(0.0)
-        feedback = np.float32(0.62)
+        feedback = self._feedback
 
         for c_i, buf in enumerate(self.comb_bufs):
             d_len = self.comb_delays[c_i]
@@ -607,7 +634,8 @@ class VectorizedDarkReverb:
 
             # Read N delayed samples from circular comb line
             end = idx + n
-            if end <= d_len:
+            wraps = end > d_len
+            if not wraps:
                 delayed[:] = buf[idx:end]
             else:
                 first = d_len - idx
@@ -619,25 +647,69 @@ class VectorizedDarkReverb:
                 self._b_damp, self._a_damp, delayed, -1, self._lp_zis[c_i]
             )
 
-            # Write x + feedback * filtered back to circular comb line
-            np.multiply(filtered, feedback, out=write_scratch)
-            np.add(x, write_scratch, out=write_scratch)
-
-            if end <= d_len:
-                buf[idx:end] = write_scratch
-            else:
+            # Write x + feedback * filtered back to circular comb line (straight into the line when it does not wrap)
+            target = buf[idx:end] if not wraps else write_scratch
+            np.multiply(filtered, feedback, out=target)
+            np.add(x, target, out=target)
+            if wraps:
                 first = d_len - idx
                 buf[idx:] = write_scratch[:first]
                 buf[: end - d_len] = write_scratch[first:]
 
             self.comb_idxs[c_i] = end if end < d_len else (end - d_len)
-            np.add(wet, delayed, out=wet)
+            if c_i == 0:
+                np.copyto(wet, delayed)  # the first comb starts the sum: no separate zero-fill pass
+            else:
+                np.add(wet, delayed, out=wet)
 
         # In-place wet/dry blend: x = x + mix * (0.33 * wet - x)
         np.multiply(wet, 0.33, out=wet)
         np.subtract(wet, x, out=wet)
         np.multiply(wet, mix, out=wet)
         np.add(x, wet, out=x)
+
+
+def allowed_cpu_count() -> int:
+    """Logical CPUs this process may run on: fewer than ``os.cpu_count()`` once it is pinned (see
+    configure_windows_process_isolation) or started with a restricted affinity."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+            if kernel32.GetProcessAffinityMask(
+                kernel32.GetCurrentProcess(), ctypes.byref(process_mask), ctypes.byref(system_mask)
+            ):
+                return max(1, bin(process_mask.value).count("1"))
+        except Exception:
+            pass
+    return os.cpu_count() or 4
+
+
+# ONNX tensor element types -> NumPy, for feeding a model in the precision it was exported with (fp16 exports exist)
+_ORT_DTYPES = {
+    "tensor(float)": np.float32,
+    "tensor(float16)": np.float16,
+    "tensor(double)": np.float64,
+    "tensor(int64)": np.int64,
+    "tensor(int32)": np.int32,
+}
+
+# What each input of an RVC v2 generator carries, under the names the common exporters give it (RVC WebUI: phone,
+# phone_lengths, pitch, pitchf, ds, rnd; w-okada / MoeSS: nsff0 and sid).
+RVC_INPUT_KINDS = {
+    "phone": "feats", "feats": "feats", "hubert": "feats",
+    "phone_lengths": "length", "feats_lengths": "length",
+    "pitch": "coarse",
+    "pitchf": "f0", "nsff0": "f0",
+    "sid": "speaker", "ds": "speaker",
+    "rnd": "noise",
+}
 
 
 class ONNXVoiceStreamer:
@@ -652,6 +724,12 @@ class ONNXVoiceStreamer:
     OVERLAP_SAMPLES = 960    # 20 ms @ 48kHz (320 @ 16kHz = 1 HuBERT frame)
     CHUNK_SAMPLES = HOP_SAMPLES + OVERLAP_SAMPLES  # 8640 samples (180 ms = 9 HuBERT frames)
 
+    # f0 search range and YIN thresholds (see _extract_f0)
+    F0_MIN_HZ = 50.0
+    F0_MAX_HZ = 1100.0
+    YIN_THRESHOLD = 0.15        # a dip of the normalised difference below this is a period
+    YIN_LOOSE_THRESHOLD = 0.35  # no dip that deep: the deepest one still counts if it is below this (breathy voice)
+
     def __init__(self, sample_rate: int = 48000):
         self.sr = sample_rate
         self.session = None
@@ -661,47 +739,61 @@ class ONNXVoiceStreamer:
         self.is_rvc = False
         self.input_name = ""
         self.hubert_input_name = "source"
+        self._hubert_dtype = np.float32
+        self._rvc_inputs: List[Tuple[str, str, type, int]] = []  # (name, kind, dtype, noise channels)
         self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.CHUNK_SAMPLES)
         self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES)
         self._worker_thread: Optional[threading.Thread] = None
+        # Every worker gets its own event: one still busy in a slow inference when the model is reloaded keeps
+        # seeing its own (set) event and exits, instead of running on next to its replacement on the same rings.
         self._stop_event = threading.Event()
         self.current_pitch_semitones: float = 0.0
         self._speech_hangover: int = 0
+        self.last_error = ""   # the last exception the worker hit (it keeps running); shown in problem reports
+        self.error_count = 0
 
         # Precompute raised-cosine overlap-add crossfade envelopes
         self._fade_out = (np.cos(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
         self._fade_in = (np.sin(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
-        # 4th-order lowpass Butterworth filter at 7.5 kHz prevents high frequencies aliasing during factor-of-3 decimation
-        self._aa_sos = signal.butter(4, 7500.0, btype="lowpass", fs=48000, output="sos")
+        self._rng = np.random.default_rng()
 
     def set_pitch(self, semitones: float) -> None:
         self.current_pitch_semitones = float(semitones)
 
-    def _start_worker(self) -> None:
+    def _stop_worker(self, timeout: float = 0.2) -> None:
         self._stop_event.set()
-        if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=0.2)
-        self._stop_event.clear()
+        worker = self._worker_thread
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=timeout)
+        self._worker_thread = None
+
+    def _start_worker(self) -> None:
+        self._stop_worker()
         self._in_ring.reset()
         self._out_ring.reset()
-        self._worker_thread = threading.Thread(target=self._rvc_worker_loop, daemon=True, name="vcomms-rvc-worker")
+        stop = threading.Event()
+        self._stop_event = stop
+        self._worker_thread = threading.Thread(
+            target=self._rvc_worker_loop, args=(stop,), daemon=True, name="vcomms-rvc-worker"
+        )
         self._worker_thread.start()
 
-    def _rvc_worker_loop(self) -> None:
+    def _rvc_worker_loop(self, stop: Optional[threading.Event] = None) -> None:
+        stop = stop or self._stop_event
         hop = self.HOP_SAMPLES
         overlap = self.OVERLAP_SAMPLES
         total_chunk = self.CHUNK_SAMPLES
         prev_tail: Optional[np.ndarray] = None
 
-        while not self._stop_event.is_set():
+        while not stop.is_set():
             if not self.active or self.session is None or self.hubert_session is None:
-                time.sleep(0.02)
+                stop.wait(0.02)
                 prev_tail = None
                 continue
 
             avail = self._in_ring.available_read()
             if avail < total_chunk:
-                time.sleep(0.005)
+                stop.wait(0.005)
                 continue
 
             # Real-Time Bound: If input accumulated a large backlog (e.g. system suspended or heavy stall),
@@ -728,43 +820,12 @@ class ONNXVoiceStreamer:
                     if prev_tail is not None and len(prev_tail) == overlap:
                         self._out_ring.write(prev_tail * self._fade_out)
                         prev_tail = None
-                    time.sleep(0.005)
+                    stop.wait(0.005)
                     continue
 
-                # Anti-aliased decimation: 4th-order lowpass at 7.5 kHz eliminates scratchy foldover aliasing
-                filtered_48k = signal.sosfilt(self._aa_sos, chunk).astype(np.float32)
-                audio_16k = filtered_48k[::3].copy()
-                # 160-sample reflect padding handles HuBERT CNN receptive field margins
-                padded_16k = np.pad(audio_16k, (160, 160), mode="reflect")
-                h_inp = padded_16k.reshape(1, 1, -1).astype(np.float32)
-
-                feats_50hz = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
-                if feats_50hz.ndim == 2:
-                    feats_50hz = feats_50hz[np.newaxis, ...]
-
-                # Double HuBERT 50 Hz frames to 100 Hz required by RVC v2 HiFi-GAN generators
-                feats_100hz = np.repeat(feats_50hz, 2, axis=1)
-                T = feats_100hz.shape[1]
-                phone_lengths = np.array([T], dtype=np.int64)
-
-                nsff0, pitch = self._extract_f0(audio_16k, target_len=T, semitones=self.current_pitch_semitones)
-
-                # Run RVC Generator (480x upsampling from 100 Hz frames = exact 48,000 Hz synthesis)
-                out = self.session.run(None, {
-                    "phone": feats_100hz,
-                    "phone_lengths": phone_lengths,
-                    "pitch": pitch,
-                    "nsff0": nsff0,
-                    "sid": np.array([0], dtype=np.int64),
-                })[0]
-                synth = np.asarray(out, dtype=np.float32).ravel()
-
-                if len(synth) != total_chunk and len(synth) > 0:
-                    synth = np.interp(
-                        np.linspace(0, len(synth), total_chunk, endpoint=False),
-                        np.arange(len(synth)),
-                        synth,
-                    ).astype(np.float32)
+                synth = self._convert(chunk)
+                if stop.is_set():
+                    break  # the model was reloaded or unloaded during inference: the rings belong to a newer worker
 
                 if len(synth) == total_chunk:
                     # Raised-cosine overlap-add crossfading with previous chunk tail eliminates clicks
@@ -776,12 +837,92 @@ class ONNXVoiceStreamer:
 
                     prev_tail = synth[hop:total_chunk].copy()
                     self._out_ring.write(ready)
-            except Exception:
+            except Exception as exc:
+                if stop.is_set():
+                    break  # unloaded mid-inference (its sessions went away): not a conversion error worth reporting
                 prev_tail = None
+                self.error_count += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
 
-        if prev_tail is not None and len(prev_tail) > 0:
-            self._out_ring.write(prev_tail)
-            prev_tail = None
+    def _convert(self, chunk: np.ndarray) -> np.ndarray:
+        """One 180 ms chunk at 48 kHz through HuBERT and the RVC generator: CHUNK_SAMPLES of converted voice."""
+        total_chunk = self.CHUNK_SAMPLES
+        # Polyphase anti-aliased 48k -> 16k decimation (linear-phase FIR; 'line' padding keeps the chunk edges, which
+        # the overlap-add crossfade uses, as clean as the middle)
+        audio_16k = signal.resample_poly(chunk, 1, 3, padtype="line").astype(np.float32)
+        # 160-sample reflect padding handles HuBERT CNN receptive field margins
+        padded_16k = np.pad(audio_16k, (160, 160), mode="reflect")
+        h_inp = padded_16k.reshape(1, 1, -1).astype(self._hubert_dtype, copy=False)
+
+        feats_50hz = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
+        if feats_50hz.ndim == 2:
+            feats_50hz = feats_50hz[np.newaxis, ...]
+
+        # Double HuBERT 50 Hz frames to 100 Hz required by RVC v2 HiFi-GAN generators
+        feats_100hz = np.repeat(feats_50hz, 2, axis=1)
+        nsff0, pitch = self._extract_f0(audio_16k, target_len=feats_100hz.shape[1], semitones=self.current_pitch_semitones)
+
+        # Run RVC Generator (480x upsampling from 100 Hz frames = exact 48,000 Hz synthesis)
+        out = self.session.run(None, self._rvc_feed(feats_100hz, pitch, nsff0))[0]
+        synth = np.asarray(out, dtype=np.float32).ravel()
+        if len(synth) != total_chunk and len(synth) > 0:
+            synth = np.interp(
+                np.linspace(0, len(synth), total_chunk, endpoint=False),
+                np.arange(len(synth)),
+                synth,
+            ).astype(np.float32)
+        return synth
+
+    def _rvc_feed(self, feats: np.ndarray, pitch: np.ndarray, nsff0: np.ndarray) -> Dict[str, np.ndarray]:
+        frames = feats.shape[1]
+        feed: Dict[str, np.ndarray] = {}
+        for name, kind, dtype, channels in self._rvc_inputs:
+            if kind == "feats":
+                value = feats
+            elif kind == "length":
+                value = np.array([frames])
+            elif kind == "coarse":
+                value = pitch
+            elif kind == "f0":
+                value = nsff0
+            elif kind == "speaker":
+                value = np.array([0])
+            else:  # noise: RVC WebUI exports take the flow's random input from the caller
+                value = self._rng.standard_normal((1, channels, frames))
+            feed[name] = np.asarray(value).astype(dtype, copy=False)
+        return feed
+
+    def _plan_rvc_inputs(self, inputs) -> Optional[str]:
+        """Reads what the generator wants; returns why it cannot be fed, or None."""
+        plan = []
+        for inp in inputs:
+            kind = RVC_INPUT_KINDS.get(inp.name.lower())
+            if kind is None:
+                return f"The voice model has an input V-COMMS does not know how to fill: '{inp.name}'."
+            channels = 192
+            shape = getattr(inp, "shape", None) or []
+            if kind == "noise" and len(shape) >= 2 and isinstance(shape[1], int) and shape[1] > 0:
+                channels = shape[1]
+            plan.append((inp.name, kind, _ORT_DTYPES.get(getattr(inp, "type", ""), np.float32), channels))
+        if not any(kind == "feats" for _name, kind, _dtype, _channels in plan):
+            return "The voice model has no HuBERT feature input (phone or feats)."
+        self._rvc_inputs = plan
+        return None
+
+    @staticmethod
+    def _session_options(rt):
+        sess_opts = rt.SessionOptions()
+        sess_opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # As many threads as the cores this process may use (it is pinned to a few on bigger PCs), at most 8. They
+        # must not spin-wait between runs: a spinning pool would burn those same cores and starve the audio thread.
+        sess_opts.intra_op_num_threads = min(8, max(2, allowed_cpu_count()))
+        sess_opts.inter_op_num_threads = 1
+        try:
+            sess_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            sess_opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        except Exception:
+            pass
+        return sess_opts
 
     def load_model(self, model_path: str) -> Tuple[bool, str]:
         if not ONNX_AVAILABLE:
@@ -811,19 +952,19 @@ class ONNXVoiceStreamer:
                     "CPUExecutionProvider",
                 ]
             available = [p for p in providers if p in rt.get_available_providers()]
-            sess_opts = rt.SessionOptions()
-            sess_opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
-            # Scale intra_op threads dynamically: 6 threads on 12-core Snapdragon X Elite, leaving cores free for audio & system
-            cpu_count = os.cpu_count() or 4
-            sess_opts.intra_op_num_threads = min(8, max(4, cpu_count // 2))
+            sess_opts = self._session_options(rt)
             self.session = rt.InferenceSession(model_path, sess_options=sess_opts, providers=available)
             inputs = self.session.get_inputs()
             input_names = [inp.name.lower() for inp in inputs]
 
             # Detect whether this is an RVC Synthesizer (phone, pitch, nsff0, sid)
-            is_rvc = any(name in ("phone", "pitch", "nsff0", "feats", "hubert") for name in input_names) or len(inputs) > 2
+            is_rvc = any(name in RVC_INPUT_KINDS and name != "sid" for name in input_names) or len(inputs) > 2
             if is_rvc:
                 self.is_rvc = True
+                problem = self._plan_rvc_inputs(inputs)
+                if problem:
+                    self.unload()
+                    return False, problem
                 # Look for HuBERT ContentVec feature extractor in models/ or model directory
                 model_dir = os.path.dirname(os.path.abspath(model_path))
                 appdata_models = os.path.join(os.environ.get("APPDATA", ""), "V-COMMS", "models")
@@ -853,25 +994,15 @@ class ONNXVoiceStreamer:
                 self.hubert_session = rt.InferenceSession(hubert_path, sess_options=sess_opts, providers=available)
                 h_inps = self.hubert_session.get_inputs()
                 self.hubert_input_name = h_inps[0].name if h_inps else "source"
+                self._hubert_dtype = _ORT_DTYPES.get(getattr(h_inps[0], "type", ""), np.float32) if h_inps else np.float32
 
-                # Pre-warm GPU/CPU execution providers and compile kernels for exact streaming shape
+                # One silent chunk through the exact streaming path: compiles the GPU/CPU kernels for the streaming
+                # shape before the first word, and a model that cannot run is reported now instead of going quiet.
                 try:
-                    dummy_16k_len = self.CHUNK_SAMPLES // 3
-                    dummy_h = np.zeros((1, 1, dummy_16k_len + 320), dtype=np.float32)
-                    dummy_feats = self.hubert_session.run(None, {self.hubert_input_name: dummy_h})[0]
-                    if dummy_feats.ndim == 2:
-                        dummy_feats = dummy_feats[np.newaxis, ...]
-                    dummy_100hz = np.repeat(dummy_feats, 2, axis=1)
-                    dT = dummy_100hz.shape[1]
-                    self.session.run(None, {
-                        "phone": dummy_100hz,
-                        "phone_lengths": np.array([dT], dtype=np.int64),
-                        "pitch": np.full((1, dT), 54, dtype=np.int64),
-                        "nsff0": np.full((1, dT), 200.0, dtype=np.float32),
-                        "sid": np.array([0], dtype=np.int64),
-                    })
-                except Exception:
-                    pass
+                    self._convert(np.zeros(self.CHUNK_SAMPLES, dtype=np.float32))
+                except Exception as exc:
+                    self.unload()
+                    return False, f"The voice model could not run a test chunk ({type(exc).__name__}: {exc})."
 
                 self.active = True
                 self._start_worker()
@@ -890,14 +1021,12 @@ class ONNXVoiceStreamer:
     def unload(self) -> None:
         """Forgets the model (and frees its memory). Stops the background worker thread."""
         self.active = False
-        self._stop_event.set()
-        if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=0.2)
-        self._worker_thread = None
+        self._stop_worker()
         self.session = None
         self.hubert_session = None
         self.is_rvc = False
         self.input_name = ""
+        self._rvc_inputs = []
         self._in_ring.reset()
         self._out_ring.reset()
 
@@ -907,27 +1036,66 @@ class ONNXVoiceStreamer:
         target_len: Optional[int] = None,
         semitones: float = 0.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Pitch per RVC frame with YIN (de Cheveigne & Kawahara, 2002), all frames at once:
+          d(t)  = sum_j (x_j - x_{j+t})^2 = e0 + e_t - 2 r(t)   (r through one FFT product per frame)
+          d'(t) = d(t) * t / sum_{k<=t} d(k)                     (cumulative mean normalisation)
+        The period is the first dip of d' below YIN_THRESHOLD, followed down to its bottom and refined by a parabola.
+        A plain autocorrelation peak cannot be used: it favours the shortest lags, so a voice whose energy sits in
+        its fundamental (a low male voice, a hum) reads as 1.1 kHz.
+        """
+        sr = 16000
         if target_len is None:
             target_len = max(1, len(audio_16k) // 320)
-        f0 = np.zeros(target_len, dtype=np.float32)
-        min_lag = int(16000 / 1100) # ~14
-        max_lag = int(16000 / 50)   # 320
-        frame_len = max_lag * 2     # 640
-        pad_len = frame_len // 2    # 320
-        # Symmetric reflection padding ensures end frames never drop to zero pitch
-        padded = np.pad(audio_16k, (pad_len, pad_len), mode="reflect")
+        min_lag = int(sr / self.F0_MAX_HZ)   # 14
+        max_lag = int(sr / self.F0_MIN_HZ)   # 320
+        win = max_lag * 2                    # 640-sample integration window: two periods of the lowest pitch
+        span = win + max_lag + 1             # samples one frame needs
+        nfft = 1 << int(np.ceil(np.log2(span)))  # 1024: j + t < nfft for every term, so the FFT product never wraps
 
-        hop = len(audio_16k) / float(target_len)
-        for i in range(target_len):
-            start = int(round(i * hop))
-            frame = padded[start : start + frame_len]
-            corr = np.correlate(frame, frame, mode='full')[frame_len - 1 :]
-            energy = corr[0]
-            if energy > 1e-4:
-                lag_region = corr[min_lag:max_lag]
-                if len(lag_region) > 0 and np.max(lag_region) > 0.40 * energy:
-                    peak_lag = min_lag + np.argmax(lag_region)
-                    f0[i] = 16000.0 / float(peak_lag)
+        x = np.asarray(audio_16k, dtype=np.float32)
+        hop = len(x) / float(target_len)
+        # Frame i is centred on i * hop. At the chunk edges the window slides inward instead of reading padding: a
+        # reflected (time-reversed) waveform is not periodic, so padded edge frames read as unvoiced, and the edge
+        # frames are exactly the 20 ms the overlap-add crossfade blends with the neighbouring chunks.
+        starts = np.rint(np.arange(target_len) * hop - win / 2).astype(np.intp)
+        if len(x) < span:
+            x = np.pad(x, (0, span - len(x)))
+        np.clip(starts, 0, len(x) - span, out=starts)
+        frames = np.lib.stride_tricks.sliding_window_view(x, span)[starts]
+
+        spec = np.fft.rfft(frames, nfft, axis=1)
+        spec_head = np.fft.rfft(frames[:, :win], nfft, axis=1)
+        r = np.fft.irfft(np.conj(spec_head) * spec, nfft, axis=1)[:, : max_lag + 1]
+        energy = np.zeros((target_len, span + 1), dtype=np.float64)
+        np.cumsum(frames * frames, axis=1, out=energy[:, 1:])
+        e0 = energy[:, win] - energy[:, 0]
+        e_t = energy[:, win : win + max_lag + 1] - energy[:, : max_lag + 1]
+        diff = np.maximum(e0[:, None] + e_t - 2.0 * r, 0.0)
+        diff[:, 0] = 0.0
+        running = np.cumsum(diff[:, 1:], axis=1)
+        cmnd = np.ones_like(diff)
+        np.divide(diff[:, 1:] * np.arange(1, max_lag + 1), running, out=cmnd[:, 1:], where=running > 1e-12)
+
+        candidates = cmnd[:, min_lag:max_lag]
+        below = candidates < self.YIN_THRESHOLD
+        has_dip = below.any(axis=1)
+        first = np.argmax(below, axis=1)
+        bottom = np.empty_like(below)  # True where the curve stops falling
+        np.greater_equal(candidates[:, 1:], candidates[:, :-1], out=bottom[:, :-1])
+        bottom[:, -1] = True
+        bottom &= np.arange(max_lag - min_lag) >= first[:, None]
+        k = np.where(has_dip, np.argmax(bottom, axis=1), np.argmin(candidates, axis=1))
+        rows = np.arange(target_len)
+        voiced = (e0 > 1e-4) & (has_dip | (candidates[rows, k] < self.YIN_LOOSE_THRESHOLD))
+
+        lag_i = min_lag + k  # always 1 <= lag_i < max_lag, so both neighbours exist
+        left, mid, right = cmnd[rows, lag_i - 1], cmnd[rows, lag_i], cmnd[rows, lag_i + 1]
+        curve = left - 2.0 * mid + right
+        safe = np.abs(curve) > 1e-12
+        shift = np.where(safe, 0.5 * (left - right) / np.where(safe, curve, 1.0), 0.0)
+        lag = lag_i + np.clip(shift, -1.0, 1.0)
+        f0 = np.where(voiced, sr / lag, 0.0).astype(np.float32)
 
         # 3-tap median filtering removes octave-jump glitches and pitch flicker
         if target_len >= 3:
@@ -981,9 +1149,10 @@ class ONNXVoiceStreamer:
 # ============================================================================
 
 # Filter designs shared by every DSP chain. The ones the built-in presets need are pinned at start-up (see
-# prewarm_filter_designs); designs made while a slider is dragged go into a small cache that is emptied when it fills.
+# prewarm_filter_designs); designs made while a slider is dragged go into a small least-recently-used cache. (Emptying
+# it whole when full could throw away the band design a snapshot had just stored, in favour of its formant design.)
 _PINNED_DESIGNS: Dict[tuple, np.ndarray] = {}
-_SWEEP_DESIGNS: Dict[tuple, np.ndarray] = {}
+_SWEEP_DESIGNS: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 _SWEEP_DESIGN_LIMIT = 64
 
 
@@ -1044,16 +1213,19 @@ class RealTimeDSPChain:
         sos = _PINNED_DESIGNS.get(key)
         if sos is None:
             sos = _SWEEP_DESIGNS.get(key)
-            if sos is not None and pin:
-                _PINNED_DESIGNS[key] = sos
+            if sos is not None:
+                if pin:
+                    _PINNED_DESIGNS[key] = sos
+                else:
+                    _SWEEP_DESIGNS.move_to_end(key)  # just used: the last to go
         if sos is None:
             sos = build()
             if pin:
                 _PINNED_DESIGNS[key] = sos
             else:
-                if len(_SWEEP_DESIGNS) >= _SWEEP_DESIGN_LIMIT:
-                    _SWEEP_DESIGNS.clear()
                 _SWEEP_DESIGNS[key] = sos
+                while len(_SWEEP_DESIGNS) > _SWEEP_DESIGN_LIMIT:
+                    _SWEEP_DESIGNS.popitem(last=False)  # the least recently used design goes
         return sos
 
     def _compile_snapshot(self, params: VoiceParameters, pin: bool = False) -> DSPImmutableSnapshot:
@@ -1223,8 +1395,8 @@ class AudioEngineManager:
 
         self.primary_stream = None
         self.monitor_stream = None
-        self.monitor_ring.reset()
         self.is_running = False
+        self.onnx_message = ""  # what loading the AI voice model said at the last start ("" when none was loaded)
 
         # Published by the audio callback (single attribute stores, atomic under the GIL)
         self.latest_in_db: float = -80.0
@@ -1292,19 +1464,18 @@ class AudioEngineManager:
         seen_in = set()
         seen_out = set()
 
-        for pass_num in (1, 2):
-            for idx, dev in enumerate(devices):
-                if preferred_api_idx is not None and dev["hostapi"] != preferred_api_idx:
-                    continue
-                name = dev["name"].strip()
-                api_name = hostapis[dev["hostapi"]]["name"]
-                label = f"{name} [{api_name}]"
-                if dev["max_input_channels"] > 0 and name not in seen_in:
-                    inputs.append((idx, label))
-                    seen_in.add(name)
-                if dev["max_output_channels"] > 0 and name not in seen_out:
-                    outputs.append((idx, label))
-                    seen_out.add(name)
+        for idx, dev in enumerate(devices):
+            if preferred_api_idx is not None and dev["hostapi"] != preferred_api_idx:
+                continue
+            name = dev["name"].strip()
+            api_name = hostapis[dev["hostapi"]]["name"]
+            label = f"{name} [{api_name}]"
+            if dev["max_input_channels"] > 0 and name not in seen_in:
+                inputs.append((idx, label))
+                seen_in.add(name)
+            if dev["max_output_channels"] > 0 and name not in seen_out:
+                outputs.append((idx, label))
+                seen_out.add(name)
 
         if not inputs and not outputs:
             for idx, dev in enumerate(devices):
@@ -1371,8 +1542,7 @@ class AudioEngineManager:
         self.latest_out_db = max(-80.0, 20.0 * np.log10(out_rms))
 
         if outdata.ndim > 1:
-            for ch in range(outdata.shape[1]):
-                outdata[:, ch] = processed
+            outdata[:] = processed[:, None]  # one broadcast copy fills every channel
         else:
             outdata[:] = processed
 
@@ -1413,8 +1583,11 @@ class AudioEngineManager:
         try:
             self.dsp = RealTimeDSPChain(self.config.sample_rate)
             self.dsp.update_parameters(self.config.current_params)
-            if self.config.onnx_model_path:
-                self.dsp.onnx_streamer.load_model(self.config.onnx_model_path)
+            # The AI model (and HuBERT, ~360 MB) is only loaded when the AI voice is on; switching it on later loads it
+            # then (EngineBridge.set_flag). Loading it on every start costs seconds and memory for a voice not in use.
+            self.onnx_message = ""
+            if self.config.enable_onnx and self.config.onnx_model_path:
+                _ok, self.onnx_message = self.dsp.onnx_streamer.load_model(self.config.onnx_model_path)
 
             in_info = sd.query_devices(in_idx)
             out_info = sd.query_devices(out_idx)
@@ -1800,10 +1973,15 @@ class Win32HotkeyListener(threading.Thread):
         reverted: List[int] = []
         for hk_id in refused:
             if previous.get(hk_id) != self._wanted.get(hk_id):  # a change Windows refused: keep what worked before
-                self._wanted[hk_id] = previous.get(hk_id)
+                back = previous.get(hk_id)
+                if back is not None and any(o != hk_id and c == back for o, c in self._wanted.items()):
+                    # another action took that combination over in this same change (a profile load or Restore
+                    # defaults moves several at once): Not set, rather than two actions on one combination
+                    back = None
+                self._wanted[hk_id] = back
                 reverted.append(hk_id)
-                if previous.get(hk_id) is not None:
-                    self._register(hk_id, previous[hk_id])
+                if back is not None:
+                    self._register(hk_id, back)
         return refused, reverted
 
     def _publish(self, token, kind: str, refused: Dict[int, int], reverted: List[int]) -> None:
@@ -1922,26 +2100,101 @@ def prewarm_filter_designs(sample_rate: int = 48000, extra: Iterable[VoiceParame
         chain.prepare_parameters(params)
 
 
+# Numbers a profile may set, and where they must lie. A value outside a range (or of the wrong type) is ignored and
+# the current setting kept: profiles are hand-editable files, and a block size of 999999 or a 192 kHz rate (the
+# pitch shifter's 36 ms window would no longer fit its delay line) must never reach the audio callback.
+PROFILE_LIMITS: Dict[str, Tuple[float, float]] = {
+    "sample_rate": (16000, 96000),
+    "block_size": (32, MAX_BLOCK_SIZE),
+    "monitor_volume": (0.0, 1.0),
+}
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _profile_value(name: str, current, value):
+    """``value`` checked against the type (and limits) of the setting it replaces; ``current`` when it does not fit."""
+    if isinstance(current, bool):
+        return value if isinstance(value, bool) else current
+    if isinstance(current, str):
+        return value if isinstance(value, str) else current
+    if not _is_number(value):
+        return current
+    lo, hi = PROFILE_LIMITS.get(name, (float("-inf"), float("inf")))
+    if isinstance(current, int):
+        if float(value) != int(value) or not lo <= value <= hi:
+            return current
+        return int(value)
+    return float(min(max(float(value), lo), hi))
+
+
+def _profile_params(raw: dict) -> VoiceParameters:
+    """Voice parameters from a profile: missing ones take their defaults, every number is clamped to its slider."""
+    params = VoiceParameters()
+    if isinstance(raw.get("name"), str):
+        params.name = raw["name"]
+    for key, (lo, hi) in PARAM_RANGES.items():
+        value = raw.get(key)
+        if _is_number(value):
+            setattr(params, key, float(min(max(float(value), lo), hi)))
+    return params
+
+
 def load_profile_into(config: AppConfig, path: Path) -> bool:
-    """Applies a saved JSON profile onto ``config`` in place (the audio engine keeps seeing the same object)."""
+    """
+    Applies a saved JSON profile onto ``config`` in place (the audio engine keeps seeing the same object). Everything
+    is checked first and then applied in one go: a file that cannot be read changes nothing, and a single bad value
+    is skipped instead of leaving the settings half loaded.
+    """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        params_raw = raw.pop("current_params", None)
-        hotkeys_raw = raw.pop("hotkeys", None)
-        for k, v in raw.items():
-            if hasattr(config, k):
-                setattr(config, k, v)
-        if params_raw:
-            config.current_params = VoiceParameters(**params_raw)
-        if isinstance(hotkeys_raw, dict):  # a profile from before hotkeys could be changed has none: keep the current ones
-            config.hotkeys = hk.normalize_bindings(hotkeys_raw)
-        return True
-    except Exception:
+        raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
         return False
+    if not isinstance(raw, dict):
+        return False
+    updates = {}
+    for f in fields(AppConfig):
+        if f.name in ("current_params", "hotkeys") or f.name not in raw:
+            continue
+        updates[f.name] = _profile_value(f.name, getattr(config, f.name), raw[f.name])
+    params_raw = raw.get("current_params")
+    if isinstance(params_raw, dict) and params_raw:
+        updates["current_params"] = _profile_params(params_raw)
+    if isinstance(raw.get("hotkeys"), dict):  # a profile from before hotkeys could be changed has none: keep the current ones
+        updates["hotkeys"] = hk.normalize_bindings(raw["hotkeys"])
+    for name, value in updates.items():
+        setattr(config, name, value)
+    return True
 
 
 def save_profile(config: AppConfig, path: Path) -> None:
-    path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+    """Atomic, like the preset library and hotkeys.json: the old file stays whole until the new one is complete."""
+    path = Path(path)
+    data = json.dumps(asdict(config), indent=2)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _find_device(saved: str, entries: List[Tuple[int, str]]) -> Optional[int]:
+    """Position of a saved device: its exact label first, then the first label that contains it; None when it is gone.
+    (Containment alone would take "USB Headset" for a saved "Headset".)"""
+    if not saved:
+        return None
+    for i, (_, label) in enumerate(entries):
+        if label == saved:
+            return i
+    return next((i for i, (_, label) in enumerate(entries) if saved in label), None)
 
 
 def pick_device_targets(
@@ -1951,33 +2204,23 @@ def pick_device_targets(
 ) -> Tuple[int, int, int]:
     """
     Which entries (positions in ``inputs`` / ``outputs``, not device ids) to preselect for mic, cable and monitor.
-    A saved device name wins; otherwise the mic is the first input, the cable is the first "CABLE Input"
-    (outputs are listed WASAPI-first, so that is the WASAPI endpoint) and the monitor is the first output.
+    A saved device name wins; otherwise (nothing saved, or the saved device is unplugged) the mic is the first input,
+    the cable is the first "CABLE Input" (outputs are listed WASAPI-first, so that is the WASAPI endpoint) and the
+    monitor is the first output that is neither the cable output nor another virtual cable.
     """
-    in_target = 0
-    for i, (_, label) in enumerate(inputs):
-        if config.input_device_name and config.input_device_name in label:
-            in_target = i
+    in_target = _find_device(config.input_device_name, inputs)
+    in_target = 0 if in_target is None else in_target
 
-    out_target = 0
-    mon_target = 0
     cable_idx = next((i for i, (_, label) in enumerate(outputs) if "CABLE INPUT" in label.upper()), None)
-    for i, (_, label) in enumerate(outputs):
-        if config.output_device_name and config.output_device_name in label:
-            out_target = i
-        elif not config.output_device_name and cable_idx is not None:
-            out_target = cable_idx
+    out_target = _find_device(config.output_device_name, outputs)
+    if out_target is None:
+        out_target = cable_idx if cable_idx is not None else 0
 
-        if config.monitor_device_name and config.monitor_device_name in label:
-            mon_target = i
-
-    # If no monitor was explicitly saved and cable is selected as output,
-    # default monitor to a different physical output (e.g. Headphones/Speakers)
-    if not config.monitor_device_name and mon_target == out_target:
-        for i, (_, label) in enumerate(outputs):
-            if i != out_target:
-                mon_target = i
-                break
+    mon_target = _find_device(config.monitor_device_name, outputs)
+    if mon_target is None:
+        others = [i for i in range(len(outputs)) if i != out_target]
+        physical = [i for i in others if "CABLE" not in outputs[i][1].upper()]
+        mon_target = (physical or others or [0])[0]
 
     return in_target, out_target, mon_target
 
@@ -2043,6 +2286,13 @@ def run_production_self_test() -> int:
         _ = dsp.process_block(synth_voice, use_onnx=False)
     snap_after = tracemalloc.take_snapshot()
     tracemalloc.stop()
+    only_engine = [tracemalloc.Filter(True, __file__)]
+    retained = sum(
+        stat.size_diff
+        for stat in snap_after.filter_traces(only_engine).compare_to(snap_before.filter_traces(only_engine), "lineno")
+    )
+    assert retained < 16 * 1024, f"DSP chain retained {retained} bytes over 50 blocks (memory leak)!"
+    print(f"[PASS] Memory audit: {max(retained, 0)} bytes retained by the DSP chain over 50 blocks.")
 
     timings_ms: List[float] = []
     for preset_name, preset_params in TACTICAL_PRESETS.items():

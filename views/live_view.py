@@ -180,13 +180,16 @@ class LiveView(PageBase):
         else:
             self.presetsTitle.setText("Voice presets")
 
-        eff1 = QGraphicsOpacityEffect(self.tileGrid)
-        eff1.setOpacity(0.38 if onnx_active else 1.0)
-        self.tileGrid.setGraphicsEffect(eff1)
-
-        eff2 = QGraphicsOpacityEffect(self.femaleGrid)
-        eff2.setOpacity(0.38 if onnx_active else 1.0)
-        self.femaleGrid.setGraphicsEffect(eff2)
+        for grid in (self.tileGrid, self.femaleGrid):
+            if onnx_active:
+                effect = grid.graphicsEffect()
+                if not isinstance(effect, QGraphicsOpacityEffect):
+                    effect = QGraphicsOpacityEffect(grid)
+                    grid.setGraphicsEffect(effect)
+                effect.setOpacity(0.38)
+            elif grid.graphicsEffect() is not None:
+                # an opacity effect renders the grid offscreen on every repaint, even at 1.0: only keep it while dimmed
+                grid.setGraphicsEffect(None)
 
         self._select_tiles()
 
@@ -195,8 +198,10 @@ class LiveView(PageBase):
         msg = data.get("message", "")
         if path:
             name = Path(path).name
-            if msg and "Failed" not in msg and "error" not in msg.lower():
-                self.modelRow.contentLabel.setText(f"{name} ({msg})")
+            if msg.startswith("NEED_HUBERT"):
+                self.modelRow.contentLabel.setText(f"{name} (needs the HuBERT base model)")
+            elif msg and data.get("enabled") and "Failed" not in msg and "error" not in msg.lower():
+                self.modelRow.contentLabel.setText(f"{name} ({msg})")  # a load report, e.g. "RVC Loaded on DML"
             else:
                 self.modelRow.contentLabel.setText(name)
         else:

@@ -14,6 +14,7 @@ import appdata
 
 HUBERT_FILENAME = "vec-768-layer-12.onnx"
 HUBERT_SHA256 = "b3886e7dff1495cda514f94f4680a7b1261e05d6929f5c764cdb17934b413c2a"
+MIN_MODEL_BYTES = 100_000_000  # the real file is ~360 MB; anything smaller is an error page or a cut-off download
 HUBERT_MIRRORS = [
     "https://huggingface.co/DogManTC/test-rvc-onnx/resolve/main/vec-768-layer-12.onnx",
     "https://huggingface.co/NaruseMioShirakana/MoeSS-SUBModel/resolve/main/vec-768-layer-12.onnx",
@@ -78,15 +79,11 @@ class HuBERTDownloadWorker(QThread):
                 if computed_hash != HUBERT_SHA256.lower():
                     raise ValueError(f"Checksum mismatch for {url}: expected {HUBERT_SHA256}, got {computed_hash}")
 
-                if temp_path.exists() and temp_path.stat().st_size > 100_000_000:
-                    if self.dest_path.exists():
-                        try:
-                            self.dest_path.unlink()
-                        except Exception:
-                            pass
-                    temp_path.rename(self.dest_path)
-                    self.finished.emit(True, "HuBERT ContentVec base model verified and installed successfully.")
-                    return
+                if not temp_path.exists() or temp_path.stat().st_size <= MIN_MODEL_BYTES:
+                    raise ValueError(f"Download from {url} is too small to be the HuBERT model")
+                os.replace(temp_path, self.dest_path)  # atomic, and replaces an older copy in one step
+                self.finished.emit(True, "HuBERT ContentVec base model verified and installed successfully.")
+                return
             except Exception:
                 if temp_path.exists():
                     try:

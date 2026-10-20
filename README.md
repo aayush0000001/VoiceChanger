@@ -31,7 +31,7 @@ Settings, your voice profile and custom presets live in `%APPDATA%\V-COMMS` (Set
   * **Power-of-Two Bitwise Pitch Shifter:** Dual-head rotating delay line ($2^{12} = 4096$ samples) using bitwise masking (`& 4095`), single-multiply fused linear interpolation, and the complementary Hann identity $y = v_B + g_A(v_A - v_B)$ with zero heap allocations per block.
   * **Wait-Free SPSC Monitor Ring Buffer:** Lock-free monotonic ring buffer ($2^{14} = 16384$ samples) with automatic clock-drift clamping for zero-lag *"Hear Myself"* side-tone monitoring.
   * **Zero-Roll 2x Mirrored ONNX Buffer:** Eliminates $\mathcal{O}(W)$ `np.roll` array copies during streaming AI inference by maintaining a double-length ($2W$) mirrored ring buffer that exposes $\mathcal{O}(1)$ C-contiguous views.
-* **Hybrid CPU Affinity Isolation:** Raises process priority to Above Normal and, on any PC with 8+ logical cores, pins the whole process to the final 2 logical cores. On Intel 12th–14th Gen hybrid CPUs these are E-Cores, leaving VALORANT the P-Cores; on AMD or non-hybrid CPUs they are ordinary cores. The 30Hz GUI telemetry timer also pauses when the window is closed to the system tray.
+* **Hybrid CPU Affinity Isolation:** Raises process priority to Above Normal and pins the whole process to the final logical cores: the last 4 on a PC with 12+ logical cores, the last 2 on one with 8 to 11. On Intel 12th–14th Gen hybrid CPUs these are E-Cores, leaving VALORANT the P-Cores; on AMD or non-hybrid CPUs they are ordinary cores. The AI voice's ONNX Runtime threads are sized to those cores and never spin-wait. The 30Hz GUI telemetry timer also pauses when the window is closed to the system tray.
 
 ---
 
@@ -58,6 +58,18 @@ pip install -r requirements.txt
 ```powershell
 python val_voice_changer.py --self-test
 ```
+
+### 3b. Run the Test Suite
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
+Every test block runs at least 20 iterations (set `VCOMMS_TEST_ITERATIONS` for more, and `VCOMMS_TEST_SEED_OFFSET`
+for different random cases). No audio hardware, network or real user folders are touched: sounddevice is replaced by a
+scripted fake, `%APPDATA%` points into a temp folder, no real global hotkey is registered, and the AI-voice tests run
+small stand-in HuBERT / RVC models through ONNX Runtime. The window tests (`tests/test_gui.py`) open real windows on
+Windows, so they are skipped there unless you set `VCOMMS_GUI_TESTS=1` (close V-COMMS first); elsewhere they run
+offscreen.
 
 ### 4. Launch the GUI
 ```powershell

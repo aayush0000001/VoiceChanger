@@ -18,6 +18,12 @@ def normalize_name(name: object) -> str:
     return " ".join(cleaned.split())
 
 
+def clip_name(name: object) -> str:
+    """normalize_name cut to NAME_MAX, trimmed again: a cut right after a space would otherwise keep that space, and
+    the stored (trimmed) name would no longer be the one whose uniqueness was checked."""
+    return normalize_name(name)[:NAME_MAX].rstrip()
+
+
 def check_name(
     name: str,
     existing: Iterable[str],
@@ -48,7 +54,7 @@ def check_name(
 def unique_name(base: str, existing: Iterable[str], reserved: Iterable[str], fallback: str = "Imported preset") -> str:
     """``base`` if it is free, else 'base (2)', 'base (3)'... kept within the length limit."""
     taken = {e.lower() for e in existing} | {r.lower() for r in reserved}
-    base = normalize_name(base)[:NAME_MAX] or fallback
+    base = clip_name(base) or fallback
     if base.lower() not in taken:
         return base
     n = 2

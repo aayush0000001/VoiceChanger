@@ -101,8 +101,14 @@ def mailto_url(address: str, title: str, body: str, body_limit: int = report_con
 
     text = body if len(body) <= body_limit else body[: body_limit - len(note)].rstrip() + note
     url = link(text)
-    while len(url) > MAILTO_URL_MAX and len(text) > 200:
-        text = text[: int(len(text) * 0.85)].rstrip() + note
+    # Every pass makes the text strictly shorter, note included (cutting 15% and then adding the note back would
+    # settle at ~266 characters: an endless loop for any text that encodes to 9 bytes a character, such as Japanese).
+    while len(url) > MAILTO_URL_MAX and text:
+        keep = int(len(text) * 0.85) - len(note)
+        text = text[:keep].rstrip() + note if keep > 0 else ""
+        url = link(text)
+    while len(url) > MAILTO_URL_MAX and title:  # only a subject that alone is too long gets here
+        title = title[: int(len(title) * 0.85)]
         url = link(text)
     return url
 

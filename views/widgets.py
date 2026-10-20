@@ -377,7 +377,12 @@ class Toasts:
         bar.show()  # sizes itself to its text
         self.relayout()
         bar.raise_()
-        QTimer.singleShot(duration_ms, lambda b=bar: self._expire(b))
+        # the expiry timer belongs to the toast, so it is gone with it: an ownerless singleShot can fire after the
+        # toast (or the window) was deleted, and touching a deleted InfoBar raises inside Qt, which PyQt6 aborts on
+        expiry = QTimer(bar)
+        expiry.setSingleShot(True)
+        expiry.timeout.connect(lambda b=bar: self._expire(b))
+        expiry.start(duration_ms)
 
     def relayout(self) -> None:
         y = self.TOP

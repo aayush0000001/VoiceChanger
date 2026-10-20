@@ -148,8 +148,9 @@ class SettingsView(PageBase):
         self.content.addWidget(self.aiCard)
         self.aiNote = muted(
             CaptionLabel(
-                "The model is fed the last 4096 samples as one 1 x 4096 float32 input and runs inside the audio "
-                "callback, so most real voice-conversion models (RVC and similar) will not work as they are."
+                "RVC v2 voice models run on their own thread with about 0.2 s of delay and need the HuBERT base model "
+                "(offered as a download the first time). Any other model is fed the last 4096 samples as one "
+                "1 x 4096 float32 input inside the audio callback."
             )
         )
         self.aiNote.setWordWrap(True)

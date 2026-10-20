@@ -102,6 +102,7 @@ class MainWindow(FluentWindow):
     telemetryActive = pyqtSignal(bool)
     reportPrepareRequested = pyqtSignal(str)    # the Qt / library versions line (the engine side does not know the UI)
     reportSubmitRequested = pyqtSignal(object)  # {"title", "body", "reply_to"} from the report form
+    onnxModelLoadRequested = pyqtSignal(str)    # load this voice model again once its HuBERT base model is installed
     errorOccurred = pyqtSignal(str)             # raised by the exception hooks, which can fire on any thread
 
     # Qt sends change events while the base class is still being constructed, before __init__ gets to set these
@@ -219,6 +220,7 @@ class MainWindow(FluentWindow):
         sv.reportRequested.connect(self.request_report)
         self.reportPrepareRequested.connect(b.prepare_report)
         self.reportSubmitRequested.connect(b.submit_report)
+        self.onnxModelLoadRequested.connect(b.load_onnx_model)
         self.telemetryActive.connect(b.set_telemetry_active)
 
         # bridge -> views  (state; delivered on the GUI thread)
@@ -387,7 +389,8 @@ class MainWindow(FluentWindow):
                         "title": "HuBERT Base Installed",
                         "text": "Loading your voice model now...",
                     })
-                    self.bridge.load_onnx_model(target_model_path)
+                    # queued onto the bridge thread: loading takes seconds and must not run on (or freeze) this one
+                    self.onnxModelLoadRequested.emit(target_model_path)
                 else:
                     self.show_notification({
                         "level": "error",
@@ -526,9 +529,24 @@ class MainWindow(FluentWindow):
 
     def shutdown_engine(self) -> None:
         """Stops audio and hotkeys. Safe to call more than once; also wired to QApplication.aboutToQuit."""
-        self.themeListener.terminate()
-        self.themeListener.wait(500)
+        self._stop_theme_listener()
         self.bridge.request_shutdown()
+
+    def _stop_theme_listener(self) -> None:
+        listener = self.themeListener
+        if not listener.isRunning():  # the second call (aboutToQuit after Quit) has nothing left to stop
+            return
+        if sys.platform != "win32":
+            # Off Windows the listener polls once a second and stops when asked. Killing it instead can catch it in the
+            # middle of Python code, and a thread killed there leaves its interpreter state behind (enough of those
+            # crash the process).
+            listener.requestInterruption()
+            if listener.wait(3000):
+                return
+        # On Windows it waits inside RegNotifyChangeKeyValue, which nothing can interrupt; it runs no Python code (and
+        # holds no lock) while it waits there, which is where terminate() finds it unless the theme is changing
+        listener.terminate()
+        listener.wait(500)
 
     def quit_app(self) -> None:
         if self._quitting:

@@ -18,7 +18,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import engine as eng
 import preset_names as names_rules
-from preset_names import MAX_CUSTOM_PRESETS, NAME_MAX, normalize_name  # noqa: F401  (re-exported)
+from preset_names import MAX_CUSTOM_PRESETS, NAME_MAX, clip_name, normalize_name  # noqa: F401  (re-exported)
 
 PRESET_FORMAT = "v-comms-preset"          # one exported preset
 LIBRARY_FORMAT = "v-comms-presets"        # the file the app keeps next to the profile
@@ -94,7 +94,7 @@ def export_text(name: str, params: eng.VoiceParameters) -> str:
         {
             "format": PRESET_FORMAT,
             "version": FORMAT_VERSION,
-            "name": normalize_name(name)[:NAME_MAX],
+            "name": clip_name(name),
             "params": {key: round(float(getattr(params, key)), 6) for key in PARAM_FIELDS},
         },
         indent=2,
@@ -116,7 +116,7 @@ def parse_preset_bytes(raw: bytes) -> Tuple[str, eng.VoiceParameters]:
     if data.get("version") != FORMAT_VERSION or isinstance(data.get("version"), bool):
         raise PresetError("That preset was made by a different version of V-COMMS.")
     name = data.get("name")
-    name = normalize_name(name)[:NAME_MAX] if isinstance(name, str) else ""
+    name = clip_name(name) if isinstance(name, str) else ""
     return name or "Imported preset", clean_params(data.get("params"), strict=True)
 
 
@@ -170,7 +170,7 @@ class PresetLibrary:
             if len(self.items) >= MAX_CUSTOM_PRESETS or not isinstance(entry, dict):
                 continue
             name = entry.get("name")
-            name = normalize_name(name)[:NAME_MAX] if isinstance(name, str) else ""
+            name = clip_name(name) if isinstance(name, str) else ""
             if not name or check_name(name, self.items, adding=False):
                 continue
             try:

@@ -473,6 +473,8 @@ class EngineBridge(QObject):
                     self.engine_state_changed.emit(self._engine_payload())
                     if not ok:
                         self._notify("error", "Couldn't switch audio device", self.engine.last_error or self.engine.status_text)
+                    else:
+                        self._check_ai_model()
 
     @pyqtSlot(int)
     def set_block_size(self, samples: int) -> None:
@@ -523,6 +525,7 @@ class EngineBridge(QObject):
         else:
             applog.get_logger().info("Audio engine started: %s", self.engine.status_text)
             self._check_monitor()
+            self._check_ai_model()
 
     @pyqtSlot(bool)
     def set_telemetry_active(self, active: bool) -> None:
@@ -615,7 +618,10 @@ class EngineBridge(QObject):
                         ok, msg = self.engine.dsp.onnx_streamer.load_model(self.config.onnx_model_path)
                         if not ok:
                             setattr(self.config, "enable_onnx", False)
-                            self._notify("error", "Model Load Failed", msg)
+                            if msg.startswith("NEED_HUBERT"):  # same as picking the model: offer the download
+                                self.hubert_download_requested.emit(self.config.onnx_model_path)
+                            else:
+                                self._notify("error", "Model Load Failed", msg)
                             self.flags_changed.emit(self._flags_payload())
                             self.onnx_changed.emit(self._onnx_payload(msg))
                             return
@@ -662,6 +668,24 @@ class EngineBridge(QObject):
             ok = self.engine.start_monitor(self._selected["monitor"])
             if not ok:
                 self._notify("warning", "Couldn't open monitor", "Check that your headphones are plugged in and ready.")
+
+    def _check_ai_model(self) -> None:
+        """The AI voice is on but its model did not load when the engine started. The output is silent on purpose
+        then (the raw voice must never reach the game), so say why instead of leaving the player talking into nothing."""
+        cfg = self.config
+        if not (cfg.enable_onnx and self.engine and self.engine.is_running) or self.engine.dsp.onnx_streamer.active:
+            return
+        message = self.engine.onnx_message or "No model selected."
+        applog.get_logger().warning("AI voice model not loaded at start: %s", message)
+        if message.startswith("NEED_HUBERT"):
+            self.hubert_download_requested.emit(cfg.onnx_model_path)
+        else:
+            self._notify(
+                "error",
+                "AI voice model not loaded",
+                f"{message} Your voice stays silent until a model loads or the AI voice is switched off.",
+            )
+        self.onnx_changed.emit(self._onnx_payload(message))
 
     @pyqtSlot(float)
     def set_monitor_volume(self, volume: float) -> None:
@@ -1124,7 +1148,19 @@ class EngineBridge(QObject):
             "lite_mode": cfg.lite_mode,
             "stability_buffer": cfg.stability_buffer,
             "engine": self.engine.read_session_stats() if self.engine else {},
+            "ai_model": self._ai_model_state(),
             "qt_versions": qt_versions,
+        }
+
+    def _ai_model_state(self) -> dict:
+        streamer = self.engine.dsp.onnx_streamer if self.engine else None
+        if streamer is None:
+            return {}
+        return {
+            "loaded": streamer.active,
+            "kind": ("RVC" if streamer.is_rvc else "direct") if streamer.active else "",
+            "errors": streamer.error_count,
+            "last_error": streamer.last_error,
         }
 
     @pyqtSlot(str)
