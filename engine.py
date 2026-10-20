@@ -21,6 +21,7 @@ from ctypes import wintypes
 import importlib.util
 import json
 import os
+import platform
 import queue
 import sys
 import threading
@@ -295,12 +296,14 @@ class WaitFreeSpscRingBuffer:
         self._max_lag = max_lag_samples
         self._target_cushion = target_cushion
         self._primed = False
+        self._underrun_blocks: int = 0
 
     def reset(self) -> None:
         """Clears cursors and unprimes so next stream begins with fresh cushion."""
         self._write_pos = 0
         self._read_pos = 0
         self._primed = False
+        self._underrun_blocks = 0
         self._buf.fill(0.0)
 
     def available_read(self) -> int:
@@ -340,9 +343,30 @@ class WaitFreeSpscRingBuffer:
                 return
 
         if avail < n:
-            self._primed = False
-            out.fill(0.0)
+            # Handle micro-underrun smoothly without violent unpriming:
+            # If partial audio exists, output it and zero the tail; otherwise output silence
+            if avail > 0:
+                r_idx = r_pos & self.mask
+                end = r_idx + avail
+                if end <= self.capacity:
+                    out[:avail] = self._buf[r_idx:end]
+                else:
+                    first = self.capacity - r_idx
+                    out[:first] = self._buf[r_idx:]
+                    out[first:avail] = self._buf[: end & self.mask]
+                out[avail:].fill(0.0)
+                self._read_pos = r_pos + avail
+            else:
+                out.fill(0.0)
+
+            self._underrun_blocks += 1
+            # Only unprime after persistent starvation (~20 blocks = ~100ms)
+            # so single-frame jitter does not trigger a harsh multi-frame mute
+            if self._underrun_blocks > 20:
+                self._primed = False
             return
+
+        self._underrun_blocks = 0
 
         # Clock-drift guard: prevent buildup of side-tone latency, but retain cushion so
         # the very next callback does not immediately underflow
@@ -362,9 +386,10 @@ class WaitFreeSpscRingBuffer:
         # Single monotonic integer update (Consumer-only write)
         self._read_pos = r_pos + n
 
-    def read_chunk(self, n: int) -> np.ndarray:
+    def peek_chunk(self, n: int, offset: int = 0) -> np.ndarray:
+        """Reads n samples starting from read cursor without advancing consumer read cursor."""
         out = np.empty(n, dtype=np.float32)
-        r_pos = self._read_pos
+        r_pos = self._read_pos + offset
         r_idx = r_pos & self.mask
         end = r_idx + n
         if end <= self.capacity:
@@ -373,7 +398,15 @@ class WaitFreeSpscRingBuffer:
             first = self.capacity - r_idx
             out[:first] = self._buf[r_idx:]
             out[first:] = self._buf[: end & self.mask]
-        self._read_pos = r_pos + n
+        return out
+
+    def advance_read(self, n: int) -> None:
+        """Advances consumer read cursor by n samples."""
+        self._read_pos += n
+
+    def read_chunk(self, n: int) -> np.ndarray:
+        out = self.peek_chunk(n)
+        self._read_pos += n
         return out
 
     def skip_to_latest(self, keep_samples: int) -> None:
@@ -613,6 +646,10 @@ class ONNXVoiceStreamer:
     ring buffers, ensuring zero real-time audio callback blocking and zero raw voice leakage.
     """
 
+    HOP_SAMPLES = 7680       # 160 ms @ 48kHz (2560 @ 16kHz = 8 HuBERT frames)
+    OVERLAP_SAMPLES = 960    # 20 ms @ 48kHz (320 @ 16kHz = 1 HuBERT frame)
+    CHUNK_SAMPLES = HOP_SAMPLES + OVERLAP_SAMPLES  # 8640 samples (180 ms = 9 HuBERT frames)
+
     def __init__(self, sample_rate: int = 48000):
         self.sr = sample_rate
         self.session = None
@@ -622,11 +659,15 @@ class ONNXVoiceStreamer:
         self.is_rvc = False
         self.input_name = ""
         self.hubert_input_name = "source"
-        self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=7680)
-        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=7680)
+        self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.CHUNK_SAMPLES)
+        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES * 2)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.current_pitch_semitones: float = 0.0
+
+        # Precompute raised-cosine overlap-add crossfade envelopes
+        self._fade_out = (np.cos(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
+        self._fade_in = (np.sin(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
 
     def set_pitch(self, semitones: float) -> None:
         self.current_pitch_semitones = float(semitones)
@@ -642,24 +683,44 @@ class ONNXVoiceStreamer:
         self._worker_thread.start()
 
     def _rvc_worker_loop(self) -> None:
-        chunk_samples = 7680  # 7680 @ 48kHz = 160ms (2560 @ 16kHz)
+        hop = self.HOP_SAMPLES
+        overlap = self.OVERLAP_SAMPLES
+        total_chunk = self.CHUNK_SAMPLES
+        prev_tail: Optional[np.ndarray] = None
+
         while not self._stop_event.is_set():
             if not self.active or self.session is None or self.hubert_session is None:
                 time.sleep(0.02)
+                prev_tail = None
                 continue
 
             avail = self._in_ring.available_read()
-            if avail < chunk_samples:
+            if avail < total_chunk:
                 time.sleep(0.005)
                 continue
 
-            # Real-Time Bound: If inference fell behind (e.g. on battery throttle or high OS load),
-            # skip older unread samples and process the most recent chunk so latency NEVER accumulates.
-            if avail > chunk_samples * 2:
-                self._in_ring.skip_to_latest(chunk_samples)
+            # Real-Time Bound: If input accumulated a large backlog (e.g. system suspended or heavy stall),
+            # skip older samples so latency never drifts past ~1 second
+            if avail > hop * 4:
+                self._in_ring.skip_to_latest(total_chunk + hop)
+                prev_tail = None
 
             try:
-                chunk = self._in_ring.read_chunk(chunk_samples)
+                # Read total_chunk (180ms) and advance by hop (160ms) so consecutive chunks share 20ms overlap
+                chunk = self._in_ring.peek_chunk(total_chunk)
+                self._in_ring.advance_read(hop)
+
+                # Voice Activity Detection (VAD): If input chunk is below noise floor (e.g. gate closed / pause between words),
+                # bypass heavy neural inference and prevent queuing silence into output ring buffer.
+                # Preserves CPU boost frequency, keeps thermal envelope cool, and eliminates speech startup latency.
+                chunk_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+                if chunk_rms < 0.003:
+                    if prev_tail is not None and len(prev_tail) == overlap:
+                        self._out_ring.write(prev_tail * self._fade_out)
+                        prev_tail = None
+                    time.sleep(0.005)
+                    continue
+
                 # 48kHz -> 16kHz downsampling (factor of 3 decimation)
                 audio_16k = chunk[::3].copy()
                 # 160-sample reflect padding handles HuBERT CNN receptive field margins
@@ -687,17 +748,29 @@ class ONNXVoiceStreamer:
                 })[0]
                 synth = np.asarray(out, dtype=np.float32).ravel()
 
-                if len(synth) == len(chunk):
-                    self._out_ring.write(synth)
-                elif len(synth) > 0:
-                    synth_resampled = np.interp(
-                        np.linspace(0, len(synth), len(chunk), endpoint=False),
+                if len(synth) != total_chunk and len(synth) > 0:
+                    synth = np.interp(
+                        np.linspace(0, len(synth), total_chunk, endpoint=False),
                         np.arange(len(synth)),
                         synth,
                     ).astype(np.float32)
-                    self._out_ring.write(synth_resampled)
+
+                if len(synth) == total_chunk:
+                    # Raised-cosine overlap-add crossfading with previous chunk tail eliminates clicks
+                    if prev_tail is not None and len(prev_tail) == overlap:
+                        blended_head = prev_tail * self._fade_out + synth[:overlap] * self._fade_in
+                        ready = np.concatenate([blended_head, synth[overlap:hop]])
+                    else:
+                        ready = synth[:hop]
+
+                    prev_tail = synth[hop:total_chunk].copy()
+                    self._out_ring.write(ready)
             except Exception:
-                pass
+                prev_tail = None
+
+        if prev_tail is not None and len(prev_tail) > 0:
+            self._out_ring.write(prev_tail)
+            prev_tail = None
 
     def load_model(self, model_path: str) -> Tuple[bool, str]:
         if not ONNX_AVAILABLE:
@@ -707,17 +780,31 @@ class ONNXVoiceStreamer:
         self.unload()
         try:
             rt = _load_onnxruntime()
-            # Prioritize NVIDIA RTX GPU acceleration via CUDA/TensorRT, then DirectML for DirectX 12 hardware acceleration
-            providers = [
-                "CUDAExecutionProvider",
-                "TensorrtExecutionProvider",
-                "DmlExecutionProvider",
-                "CPUExecutionProvider",
-            ]
+            # Hardware Execution Provider Selection:
+            # - On ARM64 (Qualcomm Snapdragon X Elite): Qualcomm Oryon 12-core CPU with NEON SIMD
+            #   runs ~10x faster than DirectML HLSL shader emulation on Adreno GPU.
+            # - On x86_64: Prioritize NVIDIA RTX GPU acceleration via CUDA/TensorRT, then DirectML for DirectX 12 GPUs, then CPU.
+            is_arm64 = platform.machine().lower() in ("arm64", "aarch64")
+            if is_arm64:
+                providers = [
+                    "CUDAExecutionProvider",
+                    "TensorrtExecutionProvider",
+                    "CPUExecutionProvider",
+                    "DmlExecutionProvider",
+                ]
+            else:
+                providers = [
+                    "CUDAExecutionProvider",
+                    "TensorrtExecutionProvider",
+                    "DmlExecutionProvider",
+                    "CPUExecutionProvider",
+                ]
             available = [p for p in providers if p in rt.get_available_providers()]
             sess_opts = rt.SessionOptions()
             sess_opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_opts.intra_op_num_threads = 2
+            # Scale intra_op threads dynamically: 6 threads on 12-core Snapdragon X Elite, leaving cores free for audio & system
+            cpu_count = os.cpu_count() or 4
+            sess_opts.intra_op_num_threads = min(8, max(4, cpu_count // 2))
             self.session = rt.InferenceSession(model_path, sess_options=sess_opts, providers=available)
             inputs = self.session.get_inputs()
             input_names = [inp.name.lower() for inp in inputs]
@@ -756,9 +843,10 @@ class ONNXVoiceStreamer:
                 h_inps = self.hubert_session.get_inputs()
                 self.hubert_input_name = h_inps[0].name if h_inps else "source"
 
-                # Pre-warm GPU execution providers and compile DirectX 12 shaders immediately
+                # Pre-warm GPU/CPU execution providers and compile kernels for exact streaming shape
                 try:
-                    dummy_h = np.zeros((1, 1, 2880), dtype=np.float32)
+                    dummy_16k_len = self.CHUNK_SAMPLES // 3
+                    dummy_h = np.zeros((1, 1, dummy_16k_len + 320), dtype=np.float32)
                     dummy_feats = self.hubert_session.run(None, {self.hubert_input_name: dummy_h})[0]
                     if dummy_feats.ndim == 2:
                         dummy_feats = dummy_feats[np.newaxis, ...]
@@ -776,13 +864,13 @@ class ONNXVoiceStreamer:
 
                 self.active = True
                 self._start_worker()
-                prov = self.session.get_providers()[0]
-                return True, f"RVC Loaded on {prov} (RTX Hardware Accelerated)"
+                prov = self.session.get_providers()[0].replace("ExecutionProvider", "")
+                return True, f"RVC Loaded on {prov} ({prov} Accelerated)"
             else:
                 self.is_rvc = False
                 self.input_name = inputs[0].name
                 self.active = True
-                prov = self.session.get_providers()[0]
+                prov = self.session.get_providers()[0].replace("ExecutionProvider", "")
                 return True, f"Direct Model Loaded on {prov}"
         except Exception as exc:
             self.active = False
@@ -1901,7 +1989,14 @@ def run_production_self_test() -> int:
         spsc.write(test_in, gain=0.5)
         spsc.read_into(test_out)
     assert np.allclose(test_out, test_in * 0.5, atol=1e-6), "SPSC Ring Buffer wrap-around failed!"
-    print("[PASS] WaitFreeSpscRingBuffer: Wrap-around & drift guard verified.")
+    spsc.reset()
+    spsc.write(test_in)
+    peeked = spsc.peek_chunk(block_size)
+    assert np.allclose(peeked, test_in, atol=1e-6), "peek_chunk failed!"
+    assert spsc.available_read() == block_size, "peek_chunk modified read cursor!"
+    spsc.advance_read(block_size)
+    assert spsc.available_read() == 0, "advance_read failed!"
+    print("[PASS] WaitFreeSpscRingBuffer: Wrap-around, drift guard & peek/advance verified.")
 
     # 2. Test ZeroRollMirrorBuffer contiguity & exact sample order
     mirror = ZeroRollMirrorBuffer(window_size=1024)
