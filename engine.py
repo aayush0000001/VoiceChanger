@@ -354,15 +354,17 @@ class WaitFreeSpscRingBuffer:
                     first = self.capacity - r_idx
                     out[:first] = self._buf[r_idx:]
                     out[first:avail] = self._buf[: end & self.mask]
+                fade_len = min(16, avail)
+                out[avail - fade_len : avail] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
                 out[avail:].fill(0.0)
                 self._read_pos = r_pos + avail
             else:
                 out.fill(0.0)
 
             self._underrun_blocks += 1
-            # Only unprime after persistent starvation (~20 blocks = ~100ms)
-            # so single-frame jitter does not trigger a harsh multi-frame mute
-            if self._underrun_blocks > 20:
+            # Only unprime after sustained starvation (~100 blocks = ~530ms)
+            # so neural inference jitter during multi-syllable speech never unprimes playback
+            if self._underrun_blocks > 100:
                 self._primed = False
             return
 
@@ -660,14 +662,17 @@ class ONNXVoiceStreamer:
         self.input_name = ""
         self.hubert_input_name = "source"
         self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.CHUNK_SAMPLES)
-        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES * 2)
+        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.current_pitch_semitones: float = 0.0
+        self._speech_hangover: int = 0
 
         # Precompute raised-cosine overlap-add crossfade envelopes
         self._fade_out = (np.cos(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
         self._fade_in = (np.sin(np.linspace(0.0, np.pi / 2.0, self.OVERLAP_SAMPLES, dtype=np.float32)) ** 2)
+        # 4th-order lowpass Butterworth filter at 7.5 kHz prevents high frequencies aliasing during factor-of-3 decimation
+        self._aa_sos = signal.butter(4, 7500.0, btype="lowpass", fs=48000, output="sos")
 
     def set_pitch(self, semitones: float) -> None:
         self.current_pitch_semitones = float(semitones)
@@ -710,19 +715,25 @@ class ONNXVoiceStreamer:
                 chunk = self._in_ring.peek_chunk(total_chunk)
                 self._in_ring.advance_read(hop)
 
-                # Voice Activity Detection (VAD): If input chunk is below noise floor (e.g. gate closed / pause between words),
-                # bypass heavy neural inference and prevent queuing silence into output ring buffer.
-                # Preserves CPU boost frequency, keeps thermal envelope cool, and eliminates speech startup latency.
+                # Voice Activity Detection (VAD) with 480ms Speech Hangover:
+                # Guarantees that pauses, stops, and soft consonants between syllables NEVER get cut off.
                 chunk_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
-                if chunk_rms < 0.003:
+                if chunk_rms >= 0.001:
+                    self._speech_hangover = 3  # 3 chunks = ~480ms speech continuity hangover
+                elif self._speech_hangover > 0:
+                    self._speech_hangover -= 1
+
+                if self._speech_hangover == 0:
+                    # True silence (>480ms): smoothly fade out tail and idle
                     if prev_tail is not None and len(prev_tail) == overlap:
                         self._out_ring.write(prev_tail * self._fade_out)
                         prev_tail = None
                     time.sleep(0.005)
                     continue
 
-                # 48kHz -> 16kHz downsampling (factor of 3 decimation)
-                audio_16k = chunk[::3].copy()
+                # Anti-aliased decimation: 4th-order lowpass at 7.5 kHz eliminates scratchy foldover aliasing
+                filtered_48k = signal.sosfilt(self._aa_sos, chunk).astype(np.float32)
+                audio_16k = filtered_48k[::3].copy()
                 # 160-sample reflect padding handles HuBERT CNN receptive field margins
                 padded_16k = np.pad(audio_16k, (160, 160), mode="reflect")
                 h_inp = padded_16k.reshape(1, 1, -1).astype(np.float32)
@@ -899,20 +910,28 @@ class ONNXVoiceStreamer:
         if target_len is None:
             target_len = max(1, len(audio_16k) // 320)
         f0 = np.zeros(target_len, dtype=np.float32)
-        min_lag = int(16000 / 1100)
-        max_lag = int(16000 / 50)
+        min_lag = int(16000 / 1100) # ~14
+        max_lag = int(16000 / 50)   # 320
+        frame_len = max_lag * 2     # 640
+        pad_len = frame_len // 2    # 320
+        # Symmetric reflection padding ensures end frames never drop to zero pitch
+        padded = np.pad(audio_16k, (pad_len, pad_len), mode="reflect")
+
         hop = len(audio_16k) / float(target_len)
         for i in range(target_len):
             start = int(round(i * hop))
-            frame = audio_16k[start : start + max_lag * 2] if start + max_lag * 2 <= len(audio_16k) else audio_16k[start:]
-            if len(frame) >= max_lag:
-                corr = np.correlate(frame, frame, mode='full')
-                corr = corr[len(frame) - 1 :]
-                if max_lag < len(corr):
-                    lag_region = corr[min_lag:max_lag]
-                    if len(lag_region) > 0 and np.max(lag_region) > 0.25 * corr[0]:
-                        peak_lag = min_lag + np.argmax(lag_region)
-                        f0[i] = 16000.0 / float(peak_lag)
+            frame = padded[start : start + frame_len]
+            corr = np.correlate(frame, frame, mode='full')[frame_len - 1 :]
+            energy = corr[0]
+            if energy > 1e-4:
+                lag_region = corr[min_lag:max_lag]
+                if len(lag_region) > 0 and np.max(lag_region) > 0.40 * energy:
+                    peak_lag = min_lag + np.argmax(lag_region)
+                    f0[i] = 16000.0 / float(peak_lag)
+
+        # 3-tap median filtering removes octave-jump glitches and pitch flicker
+        if target_len >= 3:
+            f0 = signal.medfilt(f0, kernel_size=3).astype(np.float32)
 
         if abs(semitones) > 0.05:
             f0 *= 2.0 ** (semitones / 12.0)
