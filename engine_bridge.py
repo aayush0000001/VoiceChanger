@@ -1,4 +1,4 @@
-"""
+﻿"""
 EngineBridge: the only door between the Fluent UI and the audio engine.
 
 The bridge is a QObject that lives on its own thread (see ``start()``), owns ``engine.AudioEngineManager`` and the
@@ -555,7 +555,7 @@ class EngineBridge(QObject):
                 "roundtrip_ms": block_ms * 2.0 + t["dsp_ms"] + driver_ms,
                 "driver_ms": driver_ms,
                 "xruns": int(t["xruns"]) + int(t["stalls"]),   # "dropouts" on screen: the driver's flags plus real stalls
-                "tag": "MUTED" if cfg.mic_muted else ("BYPASS" if cfg.bypass_effects else cfg.active_preset),
+                "tag": "MUTED" if cfg.mic_muted else ("BYPASS" if cfg.bypass_effects else ((f"AI: {Path(cfg.onnx_model_path).stem}" if cfg.onnx_model_path else "AI Voice Model") if cfg.enable_onnx else cfg.active_preset)),
             }
         )
 
@@ -626,6 +626,7 @@ class EngineBridge(QObject):
                         self.onnx_changed.emit(self._onnx_payload("No model selected."))
                         return
             self.onnx_changed.emit(self._onnx_payload())
+            self._tick()
         self.flags_changed.emit(self._flags_payload())
         if name == "hear_myself":
             if self.engine and self.engine.is_running:
@@ -1097,6 +1098,7 @@ class EngineBridge(QObject):
             self.config.enable_onnx = False
         self.flags_changed.emit(self._flags_payload())
         self.onnx_changed.emit(self._onnx_payload(message))
+        self._tick()
         if ok:
             self._notify("success", "ONNX Voice Model", message)
         else:

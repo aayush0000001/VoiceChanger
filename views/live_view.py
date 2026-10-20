@@ -188,6 +188,8 @@ class LiveView(PageBase):
         eff2.setOpacity(0.38 if onnx_active else 1.0)
         self.femaleGrid.setGraphicsEffect(eff2)
 
+        self._select_tiles()
+
     def apply_onnx(self, data: dict) -> None:
         path = data.get("path", "")
         msg = data.get("message", "")
@@ -297,8 +299,9 @@ class LiveView(PageBase):
         self.update_when_shown("preset", self._select_tiles)
 
     def _select_tiles(self) -> None:
+        onnx_on = self.onnxSwitch.isChecked()
         for key, tile in self._tiles.items():
-            tile.set_selected(key == self._active_preset)
+            tile.set_selected(key == self._active_preset and not onnx_on)
 
     def apply_flags(self, flags: dict) -> None:
         def apply() -> None:
