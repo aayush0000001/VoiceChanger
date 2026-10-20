@@ -29,6 +29,9 @@ jobs:
           New-Item -ItemType Directory -Force models | Out-Null
           Write-Host "Downloading HuBERT base model for All-in-One installer bundle..."
           Invoke-WebRequest -Uri "https://huggingface.co/NaruseMioShirakana/MoeSS-SUBModel/resolve/main/vec-768-layer-12.onnx" -OutFile "models/vec-768-layer-12.onnx" -UseBasicParsing
+          $expectedHash = "B3886E7DFF1495CDA514F94F4680A7B1261E05D6929F5C764CDB17934B413C2A"
+          $actualHash = (Get-FileHash models/vec-768-layer-12.onnx -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) { throw "HuBERT model SHA256 mismatch: $actualHash" }
 
       - name: Build the app and the installer
         shell: pwsh

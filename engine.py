@@ -376,6 +376,13 @@ class WaitFreeSpscRingBuffer:
         self._read_pos = r_pos + n
         return out
 
+    def skip_to_latest(self, keep_samples: int) -> None:
+        """Discards older unread samples so only the most recent keep_samples remain unread."""
+        w_pos = self._write_pos
+        avail = w_pos - self._read_pos
+        if avail > keep_samples:
+            self._read_pos = w_pos - keep_samples
+
 
 class ZeroRollMirrorBuffer:
     """
@@ -615,8 +622,8 @@ class ONNXVoiceStreamer:
         self.is_rvc = False
         self.input_name = ""
         self.hubert_input_name = "source"
-        self._in_ring = WaitFreeSpscRingBuffer(capacity=65536, max_lag_samples=48000, target_cushion=7680)
-        self._out_ring = WaitFreeSpscRingBuffer(capacity=65536, max_lag_samples=48000, target_cushion=7680)
+        self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=7680)
+        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=7680)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.current_pitch_semitones: float = 0.0
@@ -646,23 +653,33 @@ class ONNXVoiceStreamer:
                 time.sleep(0.005)
                 continue
 
+            # Real-Time Bound: If inference fell behind (e.g. on battery throttle or high OS load),
+            # skip older unread samples and process the most recent chunk so latency NEVER accumulates.
+            if avail > chunk_samples * 2:
+                self._in_ring.skip_to_latest(chunk_samples)
+
             try:
                 chunk = self._in_ring.read_chunk(chunk_samples)
                 # 48kHz -> 16kHz downsampling (factor of 3 decimation)
                 audio_16k = chunk[::3].copy()
-                h_inp = audio_16k.reshape(1, 1, -1).astype(np.float32)
+                # 160-sample reflect padding handles HuBERT CNN receptive field margins
+                padded_16k = np.pad(audio_16k, (160, 160), mode="reflect")
+                h_inp = padded_16k.reshape(1, 1, -1).astype(np.float32)
 
-                feats = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
-                if feats.ndim == 2:
-                    feats = feats[np.newaxis, ...]
-                T = feats.shape[1]
+                feats_50hz = self.hubert_session.run(None, {self.hubert_input_name: h_inp})[0]
+                if feats_50hz.ndim == 2:
+                    feats_50hz = feats_50hz[np.newaxis, ...]
+
+                # Double HuBERT 50 Hz frames to 100 Hz required by RVC v2 HiFi-GAN generators
+                feats_100hz = np.repeat(feats_50hz, 2, axis=1)
+                T = feats_100hz.shape[1]
                 phone_lengths = np.array([T], dtype=np.int64)
 
                 nsff0, pitch = self._extract_f0(audio_16k, target_len=T, semitones=self.current_pitch_semitones)
 
-                # Run RVC Generator
+                # Run RVC Generator (480x upsampling from 100 Hz frames = exact 48,000 Hz synthesis)
                 out = self.session.run(None, {
-                    "phone": feats,
+                    "phone": feats_100hz,
                     "phone_lengths": phone_lengths,
                     "pitch": pitch,
                     "nsff0": nsff0,
@@ -670,13 +687,15 @@ class ONNXVoiceStreamer:
                 })[0]
                 synth = np.asarray(out, dtype=np.float32).ravel()
 
-                if len(synth) > 0:
-                    synth_48k = np.interp(
+                if len(synth) == len(chunk):
+                    self._out_ring.write(synth)
+                elif len(synth) > 0:
+                    synth_resampled = np.interp(
                         np.linspace(0, len(synth), len(chunk), endpoint=False),
                         np.arange(len(synth)),
                         synth,
                     ).astype(np.float32)
-                    self._out_ring.write(synth_48k)
+                    self._out_ring.write(synth_resampled)
             except Exception:
                 pass
 
@@ -713,6 +732,7 @@ class ONNXVoiceStreamer:
                 localapp_models = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "V-COMMS", "models")
                 script_models = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
                 exe_models = os.path.join(os.path.dirname(sys.executable), "models")
+                internal_models = os.path.join(os.path.dirname(sys.executable), "_internal", "models")
                 candidates = [
                     os.path.join("models", "vec-768-layer-12.onnx"),
                     os.path.join(model_dir, "vec-768-layer-12.onnx"),
@@ -720,6 +740,7 @@ class ONNXVoiceStreamer:
                     os.path.join(localapp_models, "vec-768-layer-12.onnx"),
                     os.path.join(script_models, "vec-768-layer-12.onnx"),
                     os.path.join(exe_models, "vec-768-layer-12.onnx"),
+                    os.path.join(internal_models, "vec-768-layer-12.onnx"),
                     "vec-768-layer-12.onnx",
                     os.path.join("models", "hubert_base.onnx"),
                     os.path.join(model_dir, "hubert_base.onnx"),
@@ -737,13 +758,14 @@ class ONNXVoiceStreamer:
 
                 # Pre-warm GPU execution providers and compile DirectX 12 shaders immediately
                 try:
-                    dummy_h = np.zeros((1, 1, 2560), dtype=np.float32)
+                    dummy_h = np.zeros((1, 1, 2880), dtype=np.float32)
                     dummy_feats = self.hubert_session.run(None, {self.hubert_input_name: dummy_h})[0]
                     if dummy_feats.ndim == 2:
                         dummy_feats = dummy_feats[np.newaxis, ...]
-                    dT = dummy_feats.shape[1]
+                    dummy_100hz = np.repeat(dummy_feats, 2, axis=1)
+                    dT = dummy_100hz.shape[1]
                     self.session.run(None, {
-                        "phone": dummy_feats,
+                        "phone": dummy_100hz,
                         "phone_lengths": np.array([dT], dtype=np.int64),
                         "pitch": np.full((1, dT), 54, dtype=np.int64),
                         "nsff0": np.full((1, dT), 200.0, dtype=np.float32),
@@ -1019,9 +1041,14 @@ class RealTimeDSPChain:
         np.multiply(x, self.gate_env, out=x)
 
         # 3. Optional ONNX AI Voice Model Inference (Zero-Roll Mirror Buffer / Asynchronous SPSC Neural Pipeline)
-        if use_onnx and self.onnx_streamer.active:
-            self.onnx_streamer.set_pitch(p.pitch_semitones)
-            self.onnx_streamer.process_into(x)
+        if use_onnx:
+            if self.onnx_streamer.active:
+                self.onnx_streamer.set_pitch(p.pitch_semitones)
+                self.onnx_streamer.process_into(x)
+            else:
+                # User selected AI Voice Conversion, but model is loading, failed to load, or not selected.
+                # Output silence so raw voice NEVER leaks into game comms!
+                x.fill(0.0)
 
         # 4. Preset Character Effects (Automatically bypassed when ONNX AI Model is active)
         if not use_onnx:
@@ -1932,17 +1959,23 @@ def run_production_self_test() -> int:
     print(f"Callback Execution Latency (P95)          : {p95:.3f} ms")
     print(f"Callback Execution Latency (P99)          : {p99:.3f} ms")
     print("=" * 72)
-    assert p95 < block_deadline_ms, "P95 callback time exceeded hardware buffer deadline!"
+    assert p99 < block_deadline_ms, "P99 callback time exceeded hardware buffer deadline!"
     print("ALL PRODUCTION CHECKS PASSED.")
     return 0
 
 
 def configure_windows_process_isolation() -> None:
-    """Pins process to the final 2 E-cores on hybrid Intel HX CPUs and boosts priority."""
+    """Pins process to the final 2-4 E-cores on hybrid Intel HX CPUs and boosts priority."""
     if sys.platform != "win32":
         return
     try:
         kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+        kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+
         handle = kernel32.GetCurrentProcess()
 
         ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
@@ -1955,7 +1988,7 @@ def configure_windows_process_isolation() -> None:
             ecore_mask = (15 << (total_threads - 4))
             kernel32.SetProcessAffinityMask(handle, ctypes.c_size_t(ecore_mask))
         elif total_threads >= 8:
-            # On 8-15 thread CPUs, pin to the last 2 threads
+            # On 8-11 thread CPUs, pin to the last 2 threads
             ecore_mask = (3 << (total_threads - 2))
             kernel32.SetProcessAffinityMask(handle, ctypes.c_size_t(ecore_mask))
     except Exception:
