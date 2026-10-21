@@ -369,9 +369,9 @@ class WaitFreeSpscRingBuffer:
                 out.fill(0.0)
 
             self._underrun_blocks += 1
-            # Only unprime after sustained starvation (~100 blocks = ~530ms)
-            # so neural inference jitter during multi-syllable speech never unprimes playback
-            if self._underrun_blocks > 100:
+            # Unprime after brief starvation (~10 blocks = ~53ms) so subsequent speech
+            # starts with a healthy 2-chunk cushion without underrunning on GPU latency
+            if self._underrun_blocks > 10:
                 self._primed = False
             return
 
@@ -742,7 +742,7 @@ class ONNXVoiceStreamer:
         self._hubert_dtype = np.float32
         self._rvc_inputs: List[Tuple[str, str, type, int]] = []  # (name, kind, dtype, noise channels)
         self._in_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.CHUNK_SAMPLES)
-        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES)
+        self._out_ring = WaitFreeSpscRingBuffer(capacity=131072, max_lag_samples=48000, target_cushion=self.HOP_SAMPLES * 2)
         self._worker_thread: Optional[threading.Thread] = None
         # Every worker gets its own event: one still busy in a slow inference when the model is reloaded keeps
         # seeing its own (set) event and exits, instead of running on next to its replacement on the same rings.
@@ -807,16 +807,14 @@ class ONNXVoiceStreamer:
                 chunk = self._in_ring.peek_chunk(total_chunk)
                 self._in_ring.advance_read(hop)
 
-                # Voice Activity Detection (VAD) with 480ms Speech Hangover:
-                # Guarantees that pauses, stops, and soft consonants between syllables NEVER get cut off.
+                # Voice Activity Detection (VAD) & Neural Energy Floor:
+                # When fed silence or quiet room noise, HiFi-GAN generators synthesize unvoiced resonant
+                # noise/breath. We bypass neural synthesis on silence, fade out any trailing voice cleanly,
+                # and apply soft envelope decay near the threshold so trailing off never produces a noise blast.
                 chunk_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
-                if chunk_rms >= 0.001:
-                    self._speech_hangover = 3  # 3 chunks = ~480ms speech continuity hangover
-                elif self._speech_hangover > 0:
-                    self._speech_hangover -= 1
+                vad_floor = 0.0025  # ~-52 dB silence threshold
 
-                if self._speech_hangover == 0:
-                    # True silence (>480ms): smoothly fade out tail and idle
+                if chunk_rms < vad_floor:
                     if prev_tail is not None and len(prev_tail) == overlap:
                         self._out_ring.write(prev_tail * self._fade_out)
                         prev_tail = None
@@ -827,13 +825,21 @@ class ONNXVoiceStreamer:
                 if stop.is_set():
                     break  # the model was reloaded or unloaded during inference: the rings belong to a newer worker
 
+                # Soft envelope decay: If the speaker is whispering or trailing off softly into silence,
+                # scale synth so the neural generator's unvoiced residual noise never overwhelms the decaying voice.
+                knee = 0.015
+                if chunk_rms < knee:
+                    norm = min(1.0, max(0.0, (chunk_rms - vad_floor) / (knee - vad_floor)))
+                    synth *= float(np.sin(norm * (np.pi / 2.0)))
+
                 if len(synth) == total_chunk:
                     # Raised-cosine overlap-add crossfading with previous chunk tail eliminates clicks
                     if prev_tail is not None and len(prev_tail) == overlap:
                         blended_head = prev_tail * self._fade_out + synth[:overlap] * self._fade_in
                         ready = np.concatenate([blended_head, synth[overlap:hop]])
                     else:
-                        ready = synth[:hop]
+                        head = synth[:overlap] * self._fade_in
+                        ready = np.concatenate([head, synth[overlap:hop]])
 
                     prev_tail = synth[hop:total_chunk].copy()
                     self._out_ring.write(ready)
@@ -924,6 +930,17 @@ class ONNXVoiceStreamer:
             pass
         return sess_opts
 
+    @staticmethod
+    def _format_provider(raw_prov: str) -> str:
+        cleaned = raw_prov.replace("ExecutionProvider", "")
+        if cleaned == "Dml":
+            return "GPU (DirectML / RTX)"
+        elif cleaned in ("CUDA", "Tensorrt"):
+            return f"GPU ({cleaned})"
+        elif cleaned == "CPU":
+            return "CPU"
+        return cleaned
+
     def load_model(self, model_path: str) -> Tuple[bool, str]:
         if not ONNX_AVAILABLE:
             return False, "onnxruntime is not installed."
@@ -1006,14 +1023,14 @@ class ONNXVoiceStreamer:
 
                 self.active = True
                 self._start_worker()
-                prov = self.session.get_providers()[0].replace("ExecutionProvider", "")
-                return True, f"RVC Loaded on {prov} ({prov} Accelerated)"
+                prov_str = self._format_provider(self.session.get_providers()[0])
+                return True, f"RVC Loaded on {prov_str}"
             else:
                 self.is_rvc = False
                 self.input_name = inputs[0].name
                 self.active = True
-                prov = self.session.get_providers()[0].replace("ExecutionProvider", "")
-                return True, f"Direct Model Loaded on {prov}"
+                prov_str = self._format_provider(self.session.get_providers()[0])
+                return True, f"Direct Model Loaded on {prov_str}"
         except Exception as exc:
             self.active = False
             return False, str(exc)
