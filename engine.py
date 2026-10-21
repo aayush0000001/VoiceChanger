@@ -807,30 +807,45 @@ class ONNXVoiceStreamer:
                 chunk = self._in_ring.peek_chunk(total_chunk)
                 self._in_ring.advance_read(hop)
 
-                # Voice Activity Detection (VAD) & Neural Energy Floor:
-                # When fed silence or quiet room noise, HiFi-GAN generators synthesize unvoiced resonant
-                # noise/breath. We bypass neural synthesis on silence, fade out any trailing voice cleanly,
-                # and apply soft envelope decay near the threshold so trailing off never produces a noise blast.
-                chunk_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
-                vad_floor = 0.0025  # ~-52 dB silence threshold
+                # Polyphase anti-aliased 48k -> 16k decimation
+                audio_16k = signal.resample_poly(chunk, 1, 3, padtype="line").astype(np.float32)
 
-                if chunk_rms < vad_floor:
+                # Extract Pitch & Energy for Pitch-Aware Voice Activity Gate
+                chunk_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+                nsff0, pitch = self._extract_f0(audio_16k, target_len=18, semitones=self.current_pitch_semitones)
+                voiced_frames = int(np.count_nonzero(pitch > 1))
+
+                # Pitch-Aware Voice Activity Gate:
+                # 1. No voiced vocal cords vibrating across the chunk -> Pure silence / breath / room fan noise.
+                # 2. Or chunk RMS below ambient room noise floor (0.006 = -44 dBFS).
+                # HiFi-GAN generators synthesize resonant unvoiced breath/whoosh noise when fed unvoiced silence.
+                # Gating unvoiced chunks completely eliminates trailing hiss/whoosh upon stopping speech.
+                is_silence = (voiced_frames == 0) or (chunk_rms < 0.006)
+
+                if is_silence:
                     if prev_tail is not None and len(prev_tail) == overlap:
-                        self._out_ring.write(prev_tail * self._fade_out)
+                        # Smooth 20ms raised-cosine fade-out of previous speech tail, followed by silence
+                        blended = np.concatenate([prev_tail * self._fade_out, np.zeros(hop - overlap, dtype=np.float32)])
+                        self._out_ring.write(blended)
                         prev_tail = None
+                    else:
+                        # Continuous silence preserves healthy 2-chunk cushion so next word never underruns
+                        self._out_ring.write(np.zeros(hop, dtype=np.float32))
                     stop.wait(0.005)
                     continue
 
-                synth = self._convert(chunk)
+                synth = self._convert(chunk, audio_16k=audio_16k, pitch=pitch, nsff0=nsff0)
                 if stop.is_set():
                     break  # the model was reloaded or unloaded during inference: the rings belong to a newer worker
 
-                # Soft envelope decay: If the speaker is whispering or trailing off softly into silence,
-                # scale synth so the neural generator's unvoiced residual noise never overwhelms the decaying voice.
-                knee = 0.015
-                if chunk_rms < knee:
-                    norm = min(1.0, max(0.0, (chunk_rms - vad_floor) / (knee - vad_floor)))
-                    synth *= float(np.sin(norm * (np.pi / 2.0)))
+                # Dynamic Energy Envelope Shaping:
+                # HiFi-GAN generators output normalized amplitude (~0.12 RMS) regardless of input level.
+                # As the speaker naturally decays their voice into silence, scale synth to smoothly follow
+                # the natural vocal decay, preventing unvoiced residual noise from overpowering the voice.
+                ref_rms = 0.040
+                if chunk_rms < ref_rms:
+                    env_gain = min(1.0, max(0.0, chunk_rms / ref_rms) ** 1.5)
+                    synth *= env_gain
 
                 if len(synth) == total_chunk:
                     # Raised-cosine overlap-add crossfading with previous chunk tail eliminates clicks
@@ -850,12 +865,17 @@ class ONNXVoiceStreamer:
                 self.error_count += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
 
-    def _convert(self, chunk: np.ndarray) -> np.ndarray:
+    def _convert(
+        self,
+        chunk: np.ndarray,
+        audio_16k: Optional[np.ndarray] = None,
+        pitch: Optional[np.ndarray] = None,
+        nsff0: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """One 180 ms chunk at 48 kHz through HuBERT and the RVC generator: CHUNK_SAMPLES of converted voice."""
         total_chunk = self.CHUNK_SAMPLES
-        # Polyphase anti-aliased 48k -> 16k decimation (linear-phase FIR; 'line' padding keeps the chunk edges, which
-        # the overlap-add crossfade uses, as clean as the middle)
-        audio_16k = signal.resample_poly(chunk, 1, 3, padtype="line").astype(np.float32)
+        if audio_16k is None:
+            audio_16k = signal.resample_poly(chunk, 1, 3, padtype="line").astype(np.float32)
         # 160-sample reflect padding handles HuBERT CNN receptive field margins
         padded_16k = np.pad(audio_16k, (160, 160), mode="reflect")
         h_inp = padded_16k.reshape(1, 1, -1).astype(self._hubert_dtype, copy=False)
@@ -866,7 +886,8 @@ class ONNXVoiceStreamer:
 
         # Double HuBERT 50 Hz frames to 100 Hz required by RVC v2 HiFi-GAN generators
         feats_100hz = np.repeat(feats_50hz, 2, axis=1)
-        nsff0, pitch = self._extract_f0(audio_16k, target_len=feats_100hz.shape[1], semitones=self.current_pitch_semitones)
+        if nsff0 is None or pitch is None:
+            nsff0, pitch = self._extract_f0(audio_16k, target_len=feats_100hz.shape[1], semitones=self.current_pitch_semitones)
 
         # Run RVC Generator (480x upsampling from 100 Hz frames = exact 48,000 Hz synthesis)
         out = self.session.run(None, self._rvc_feed(feats_100hz, pitch, nsff0))[0]
