@@ -77,12 +77,18 @@ jobs:
             Write-Host "Designated as STABLE RELEASE"
             "is_prerelease=false" >> $env:GITHUB_OUTPUT
             "title_suffix=(Stable Release)" >> $env:GITHUB_OUTPUT
-            "badge=> [!NOTE]`n> **Stable Release**: Verified production build with confirmed stability.`n" >> $env:GITHUB_OUTPUT
+            "badge<<EOF" >> $env:GITHUB_OUTPUT
+            "> [!NOTE]" >> $env:GITHUB_OUTPUT
+            "> **Stable Release**: Verified production build with confirmed stability." >> $env:GITHUB_OUTPUT
+            "EOF" >> $env:GITHUB_OUTPUT
           } else {
             Write-Host "Designated as BETA / PRE-RELEASE"
             "is_prerelease=true" >> $env:GITHUB_OUTPUT
             "title_suffix=(Beta Release)" >> $env:GITHUB_OUTPUT
-            "badge=> [!WARNING]`n> **Beta / Pre-Release**: Incremental build undergoing testing. Use for early evaluation.`n" >> $env:GITHUB_OUTPUT
+            "badge<<EOF" >> $env:GITHUB_OUTPUT
+            "> [!WARNING]" >> $env:GITHUB_OUTPUT
+            "> **Beta / Pre-Release**: Incremental build undergoing testing. Use for early evaluation." >> $env:GITHUB_OUTPUT
+            "EOF" >> $env:GITHUB_OUTPUT
           }
 
       - name: Create Release and Upload Installer
