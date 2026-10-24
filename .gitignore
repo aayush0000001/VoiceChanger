@@ -38,6 +38,7 @@ logs/
 scratch.txt
 challenges_and_solutions.txt
 scratch/
+codebase.txt
 
 # AI Voice Weights & Heavy Checkpoints (keep repo lightweight)
 models/
